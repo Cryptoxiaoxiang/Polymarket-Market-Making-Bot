@@ -68,7 +68,17 @@ def test_console_status_and_pause_action_without_login(tmp_path) -> None:
             assert 'id="expiry-hours" aria-label="小时" disabled' in page
             assert 'id="account-form"' in page
             assert 'name="private_key" type="password"' in page
-            assert 'id="start" class="primary"' in page
+            assert 'id="start-button" class="btn primary"' in page
+
+            styles_request = Request(f"{origin}/static/styles.css")
+            status, styles = await asyncio.to_thread(_read, styles_request)
+            assert status == 200
+            assert ".app-shell" in styles
+
+            script_request = Request(f"{origin}/static/app.js")
+            status, script = await asyncio.to_thread(_read, script_request)
+            assert status == 200
+            assert "/api/cancel-all" not in script
 
             status_request = Request(f"{origin}/api/status")
             status, payload = await asyncio.to_thread(_read, status_request)
@@ -92,6 +102,18 @@ def test_console_status_and_pause_action_without_login(tmp_path) -> None:
             status, payload = await asyncio.to_thread(_read, pause)
             assert status == 200
             assert payload["status"]["paused"] is True
+
+            removed_cancel_all = Request(
+                f"{origin}/api/cancel-all",
+                method="POST",
+                headers={
+                    "Origin": origin,
+                    "X-Requested-With": "poly-mm-console",
+                },
+            )
+            status, payload = await asyncio.to_thread(_read, removed_cancel_all)
+            assert status == 404
+            assert payload == {"error": "not found"}
 
             invalid_expiry = Request(
                 f"{origin}/api/expiry",

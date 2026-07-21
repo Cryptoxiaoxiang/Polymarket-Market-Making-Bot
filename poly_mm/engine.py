@@ -475,13 +475,6 @@ class MarketMakerEngine:
                 logger.critical("Quote-task validity expired; all tracked orders canceled")
         return True
 
-    async def emergency_cancel(self) -> dict:
-        """Pause and clear all account orders on configured tokens, including manual ones."""
-        self.paused = True
-        await self._cancel_configured_orders_on_start()
-        logger.critical("Emergency configured-token cancellation completed")
-        return await self.snapshot()
-
     async def snapshot(self) -> dict:
         markets = []
         for market in self.config.enabled_markets:

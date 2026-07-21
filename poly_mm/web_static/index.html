@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Polymarket 自动做市机器人</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-logo">P</div>
+          <div><strong>Polymarket MM</strong><small>PASSIVE MARKET MAKER</small></div>
+        </div>
+        <div class="nav-label">控制中心</div>
+        <nav class="nav" aria-label="控制台页面">
+          <button class="active" data-view="dashboard">
+            <svg viewBox="0 0 24 24"><path d="M4 13h6V4H4v9Zm0 7h6v-4H4v4Zm10 0h6v-9h-6v9Zm0-16v4h6V4h-6Z" /></svg>
+            总览 Dashboard
+          </button>
+          <button data-view="account">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4" /><path d="M4.5 20c.8-4 3.3-6 7.5-6s6.7 2 7.5 6" /></svg>
+            账户设置
+          </button>
+          <button data-view="tasks">
+            <svg viewBox="0 0 24 24"><path d="M4 7h16M7 4v6m10 4v6M4 17h16" /></svg>
+            挂单任务<span id="market-count" class="nav-count">0</span>
+          </button>
+        </nav>
+        <div class="sidebar-spacer"></div>
+        <div class="server-card">
+          <strong>网页服务正常</strong>
+          <p id="sidebar-account">账户状态检查中</p>
+          <small>页面每 2 秒更新</small>
+        </div>
+      </aside>
+
+      <main class="main"><div class="content">
+        <div class="utility-bar">
+          <a class="x-profile-link" href="https://x.com/cryptoxiaoxiang" target="_blank" rel="noopener noreferrer" aria-label="在 X 查看 @cryptoxiaoxiang">
+            <span class="x-mark">X</span><span>@cryptoxiaoxiang</span>
+          </a>
+        </div>
+        <section id="notice" class="notice" hidden></section>
+
+        <section id="dashboard" class="view active">
+          <header class="topbar">
+            <div><p class="eyebrow">POLYMARKET CONTROL CENTER</p><h1>总览 Dashboard</h1><p class="subtitle">监控机器人、挂单与风控状态</p></div>
+            <div class="actions"><div id="mode-badge" class="pill">正在检查配置</div><button id="start-button" class="btn primary">启动挂单任务</button><button id="stop-button" class="btn secondary">停止并撤单</button></div>
+          </header>
+
+          <section class="metrics" aria-label="机器人状态">
+            <article class="metric"><div class="metric-label">任务状态</div><strong id="run-status" class="metric-value warning">检查中</strong><div id="run-status-note" class="metric-note">正在读取运行状态</div></article>
+            <article class="metric"><div class="metric-label">账户 pUSD 余额</div><strong id="balance-value" class="metric-value">尚未预检</strong><div id="balance-note" class="metric-note">预检后显示可用抵押余额</div></article>
+            <article class="metric"><div class="metric-label">当前开放订单</div><strong id="open-order-value" class="metric-value positive">0</strong><div id="open-order-note" class="metric-note">暂无机器人管理的挂单</div></article>
+            <article class="metric"><div class="metric-label">已配置市场</div><strong id="market-value" class="metric-value">—</strong><div id="configured-note" class="metric-note">等待加载配置</div></article>
+          </section>
+
+          <div class="dashboard-grid">
+            <section class="card orders-card">
+              <div class="card-head"><div><h2>当前挂单</h2><p>机器人当前管理的开放订单</p></div><span id="open-orders-summary" class="summary">暂无挂单</span></div>
+              <div class="card-body table-wrap"><table><thead><tr><th>市场</th><th>方向</th><th>价格</th><th>数量</th><th>存活时间</th></tr></thead><tbody id="open-orders-list" aria-live="polite"></tbody></table></div>
+            </section>
+            <div class="stack">
+              <section class="card"><div class="card-head"><div><h2>运行保护</h2><p>账户连接与成交保护状态</p></div><span id="guard-badge" class="status-badge"><span class="dot"></span>等待检查</span></div><div class="card-body risk-list">
+                <div class="risk-row"><strong>账户状态</strong><span id="account-state">—</span></div>
+                <div class="risk-row"><strong>User WebSocket</strong><span id="ws-state">—</span></div>
+                <div class="risk-row"><strong>成交后停止对应 token</strong><span id="fill-guard">—</span></div>
+              </div></section>
+              <section class="card"><div class="card-head"><div><h2>实盘预检</h2><p>余额、allowance、凭据与地区限制</p></div><button class="text-button" data-view-target="account">前往账户设置</button></div><div class="card-body"><p id="preflight-summary" class="preflight-summary">尚未运行预检。</p></div></section>
+            </div>
+          </div>
+
+          <section class="card page-card markets-card">
+            <div class="card-head"><div><h2>市场与仓位</h2><p>已配置 outcome 的最新盘口与持仓</p></div><span id="markets-summary" class="summary">正在读取</span></div>
+            <div class="card-body table-wrap"><table><thead><tr><th>市场</th><th>持仓</th><th>Bid</th><th>Ask</th><th>Spread</th><th>状态</th></tr></thead><tbody id="markets-list"></tbody></table></div>
+          </section>
+        </section>
+
+        <section id="account" class="view">
+          <header class="topbar"><div><p class="eyebrow">ACCOUNT</p><h1>账户设置</h1><p class="subtitle">账户信息单独保存，密钥不会显示完整内容</p></div><div id="account-badge" class="pill">正在检查账户</div></header>
+          <section class="card page-card form-card">
+            <div class="section-title"><div><h2>Polymarket 账户</h2><p>保存后自动创建或派生 L2 API 凭据</p></div><span id="secret-status" class="summary">尚未保存实盘密钥</span></div>
+            <form id="account-form" autocomplete="off">
+              <div class="form-grid">
+                <label class="field"><span>钱包 Private Key</span><input id="private-key" name="private_key" type="password" autocomplete="new-password" spellcheck="false" placeholder="留空则保留原值" /><small>只保存在 VPS，不会写入日志或返回浏览器</small></label>
+                <label class="field"><span>钱包类型 / Signature Type</span><select id="signature-type" name="signature_type"><option value="0">0 · 独立 EOA</option><option value="1">1 · POLY_PROXY</option><option value="2">2 · POLY_GNOSIS_SAFE</option><option value="3">3 · POLY_1271 Deposit Wallet</option></select><small>普通独立 EOA 请选择 0</small></label>
+                <label class="field full-field"><span>Funder / 资金钱包地址</span><input id="funder-address" name="funder_address" autocomplete="off" spellcheck="false" placeholder="EOA 留空；代理或存款钱包填写地址" /><small>类型 0 自动使用私钥导出的地址</small></label>
+              </div>
+              <p class="details-note">保存时会在 VPS 内存中校验私钥，并通过 Polymarket 官方 SDK 派生 API key、secret 和 passphrase。页面不会读取已有私钥或显示 L2 secret。</p>
+              <div class="form-actions"><button id="save-account" class="btn primary" type="submit">保存账户设置</button></div>
+            </form>
+          </section>
+          <section class="card page-card form-card">
+            <div class="section-title"><div><h2>账户连接状态</h2><p>页面只显示公开地址和是否已经配置密钥</p></div><span id="connection-status" class="summary">正在检查</span></div>
+            <div class="account-grid"><div><span>签名钱包</span><strong id="signer-address">—</strong></div><div><span>资金钱包</span><strong id="funder-status">—</strong></div><div><span>L2 API 凭据</span><strong id="credential-status">—</strong></div></div>
+          </section>
+          <section class="card page-card form-card">
+            <div class="section-title"><div><h2>实盘预检</h2><p>检查操作不会创建订单</p></div><strong id="preflight-status" class="summary">尚未检查</strong></div>
+            <p id="preflight-detail" class="details-note">保存账户后运行预检，确认 VPS 地区、pUSD 余额和 allowance。</p>
+            <div class="form-actions"><button id="run-preflight" class="btn secondary" type="button">运行实盘预检</button></div>
+          </section>
+        </section>
+
+        <section id="tasks" class="view">
+          <header class="topbar"><div><p class="eyebrow">QUOTE TASK</p><h1>挂单任务</h1><p class="subtitle">管理任务状态、有效期和风控摘要</p></div><div class="actions"><button id="pause-button" class="btn secondary">暂停并撤单</button><button id="resume-button" class="btn primary">恢复报价</button></div></header>
+          <section class="card page-card form-card">
+            <div class="section-title"><div><h2>挂单有效期</h2><p>默认不限时；到期后自动停止新挂单并撤销机器人订单</p></div><span id="expiry-state" class="summary">不限时</span></div>
+            <div class="expiry-row"><label class="switch-row compact"><span><strong>启用有效期</strong><small>关闭时任务没有截止时间</small></span><span class="switch-control"><input id="expiry-enabled" type="checkbox" /><i></i></span></label><label class="field duration-field"><span>小时</span><select id="expiry-hours" aria-label="小时" disabled></select></label><label class="field duration-field"><span>分钟</span><select id="expiry-minutes" aria-label="分钟" disabled></select></label></div>
+            <div class="form-actions"><button id="apply-expiry" class="btn primary" type="button">应用有效期设置</button></div>
+          </section>
+          <section class="card page-card form-card">
+            <div class="section-title"><div><h2>风险与刷新</h2><p>当前 config.toml 中生效的只读配置</p></div><span id="task-mode" class="summary">正在读取</span></div>
+            <div class="config-grid"><div><span>单笔最大数量</span><strong id="max-order-size">—</strong></div><div><span>单 token 最大仓位</span><strong id="max-position">—</strong></div><div><span>总开放名义金额</span><strong id="max-notional">—</strong></div><div><span>撤单刷新秒数</span><strong id="cancel-seconds">—</strong></div></div>
+          </section>
+        </section>
+      </div></main>
+    </div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

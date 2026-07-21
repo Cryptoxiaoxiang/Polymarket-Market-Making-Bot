@@ -82,12 +82,21 @@ class DashboardController:
         }
 
     async def snapshot(self) -> dict[str, Any]:
+        config = load_config(self.config_path)
         if self.engine is not None:
             status = await self.engine.snapshot()
         else:
-            status = self._stopped_snapshot()
+            status = self._stopped_snapshot(config)
         status["running"] = self.running
         status["account"] = self.account_status()
+        status["configuration"] = {
+            "market_count": len(config.enabled_markets),
+            "cancel_after_seconds": config.cancel_after_seconds,
+            "max_order_size": str(config.risk.max_order_size),
+            "max_position_per_token": str(config.risk.max_position_per_token),
+            "max_total_open_notional": str(config.risk.max_total_open_notional),
+            "halt_on_fill": config.halt_on_fill,
+        }
         if self.last_error:
             status["last_error"] = self.last_error
             if not self.running:
@@ -141,15 +150,6 @@ class DashboardController:
 
     async def resume_quotes(self) -> dict[str, Any]:
         return await self._active_engine().resume_quotes()
-
-    async def emergency_cancel(self) -> dict[str, Any]:
-        if self.engine is None:
-            config = await self._resolved_config()
-            self.engine = MarketMakerEngine(
-                config,
-                PolymarketClient(self.settings(), dry_run=config.dry_run),
-            )
-        return await self.engine.emergency_cancel()
 
     async def set_quote_expiry(self, hours: object, minutes: object) -> dict[str, Any]:
         return await self._active_engine().set_quote_expiry(hours, minutes)
@@ -247,8 +247,7 @@ class DashboardController:
             raise ValueError("请先启动挂单任务。")
         return self.engine
 
-    def _stopped_snapshot(self) -> dict[str, Any]:
-        config = load_config(self.config_path)
+    def _stopped_snapshot(self, config: BotConfig) -> dict[str, Any]:
         return {
             "phase": "stopped",
             "dry_run": config.dry_run,
@@ -257,6 +256,8 @@ class DashboardController:
             "markets": [
                 {
                     "label": market.label or market.outcome,
+                    "token_id": market.token_id,
+                    "condition_id": market.condition_id,
                     "position": "0",
                     "book": {"best_bid": None, "best_ask": None, "spread": None},
                     "halted": False,
