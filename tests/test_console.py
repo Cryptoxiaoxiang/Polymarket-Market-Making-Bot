@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import json
 from types import SimpleNamespace
 from urllib.error import HTTPError
@@ -19,11 +18,6 @@ class ConsoleFakeClient:
         return []
 
 
-def _authorization(password: str) -> str:
-    encoded = base64.b64encode(f"admin:{password}".encode()).decode()
-    return f"Basic {encoded}"
-
-
 def _read(request: Request) -> tuple[int, dict | str]:
     try:
         with urlopen(request, timeout=3) as response:
@@ -35,7 +29,7 @@ def _read(request: Request) -> tuple[int, dict | str]:
         return error.code, json.loads(error.read().decode())
 
 
-def test_console_auth_status_and_pause_action(tmp_path) -> None:
+def test_console_status_and_pause_action_without_login(tmp_path) -> None:
     async def scenario() -> None:
         engine = MarketMakerEngine(
             BotConfig(
@@ -48,7 +42,6 @@ def test_console_auth_status_and_pause_action(tmp_path) -> None:
             engine,
             host="127.0.0.1",
             port=0,
-            password="test-password",
             enabled=True,
         )
         console.start(asyncio.get_running_loop())
@@ -56,25 +49,21 @@ def test_console_auth_status_and_pause_action(tmp_path) -> None:
             assert console.address is not None
             origin = f"http://127.0.0.1:{console.address[1]}"
 
-            unauthorized = Request(f"{origin}/api/status")
-            status, payload = await asyncio.to_thread(_read, unauthorized)
-            assert status == 401
-            assert payload == {"error": "authentication required"}
-
-            authorized = Request(
-                f"{origin}/api/status",
-                headers={"Authorization": _authorization("test-password")},
-            )
-            status, payload = await asyncio.to_thread(_read, authorized)
+            status_request = Request(f"{origin}/api/status")
+            status, payload = await asyncio.to_thread(_read, status_request)
             assert status == 200
             assert payload["dry_run"] is True
             assert "private_key" not in payload
+
+            rejected = Request(f"{origin}/api/pause", method="POST")
+            status, payload = await asyncio.to_thread(_read, rejected)
+            assert status == 403
+            assert payload == {"error": "invalid control request"}
 
             pause = Request(
                 f"{origin}/api/pause",
                 method="POST",
                 headers={
-                    "Authorization": _authorization("test-password"),
                     "Origin": origin,
                     "X-Requested-With": "poly-mm-console",
                 },
@@ -88,7 +77,7 @@ def test_console_auth_status_and_pause_action(tmp_path) -> None:
     asyncio.run(scenario())
 
 
-def test_console_stays_disabled_without_password(tmp_path) -> None:
+def test_console_stays_disabled_when_config_disabled(tmp_path) -> None:
     engine = MarketMakerEngine(
         BotConfig(markets=[MarketConfig(token_id="token-1")]),
         ConsoleFakeClient(tmp_path / "orders.json"),
@@ -97,8 +86,7 @@ def test_console_stays_disabled_without_password(tmp_path) -> None:
         engine,
         host="127.0.0.1",
         port=0,
-        password=None,
-        enabled=True,
+        enabled=False,
     )
 
     loop = asyncio.new_event_loop()

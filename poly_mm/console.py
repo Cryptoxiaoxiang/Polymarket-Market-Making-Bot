@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import hmac
 import json
 import logging
 import threading
@@ -23,7 +21,7 @@ class _ConsoleHTTPServer(ThreadingHTTPServer):
 
 
 class ConsoleServer:
-    """Loopback-only, password-protected operator console."""
+    """Loopback-only operator console with same-origin control actions."""
 
     def __init__(
         self,
@@ -31,19 +29,15 @@ class ConsoleServer:
         *,
         host: str,
         port: int,
-        password: str | None,
         enabled: bool,
     ) -> None:
         self.engine = engine
         self.host = host
         self.port = port
-        self.password = password
         self.enabled = enabled
         self.loop: asyncio.AbstractEventLoop | None = None
         self._server: _ConsoleHTTPServer | None = None
         self._thread: threading.Thread | None = None
-        credentials = base64.b64encode(f"admin:{password or ''}".encode()).decode()
-        self._expected_authorization = f"Basic {credentials}"
 
     @property
     def address(self) -> tuple[str, int] | None:
@@ -55,11 +49,6 @@ class ConsoleServer:
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         if not self.enabled:
             logger.info("Local web console is disabled")
-            return
-        if not self.password:
-            logger.warning(
-                "Local web console is disabled because POLYMARKET_CONSOLE_PASSWORD is empty"
-            )
             return
         self.loop = loop
         handler = partial(_ConsoleHandler, console=self)
@@ -82,9 +71,6 @@ class ConsoleServer:
         self._server = None
         self._thread = None
 
-    def authorized(self, value: str) -> bool:
-        return hmac.compare_digest(value, self._expected_authorization)
-
     def run(self, coroutine: Coroutine, timeout: float = 30) -> dict:
         if self.loop is None or not self.loop.is_running():
             coroutine.close()
@@ -101,8 +87,6 @@ class _ConsoleHandler(BaseHTTPRequestHandler):
         super().__init__(*args, **kwargs)
 
     def do_GET(self) -> None:  # noqa: N802
-        if not self._authenticate():
-            return
         path = urlsplit(self.path).path
         if path == "/":
             self._send(HTTPStatus.OK, DASHBOARD_HTML.encode(), "text/html; charset=utf-8")
@@ -117,8 +101,6 @@ class _ConsoleHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if not self._authenticate():
-            return
         if not self._valid_control_request():
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "invalid control request"})
             return
@@ -138,19 +120,6 @@ class _ConsoleHandler(BaseHTTPRequestHandler):
         except Exception as error:
             logger.warning("Console action %s failed: %s", path, error)
             self._send_json(HTTPStatus.CONFLICT, {"error": str(error)})
-
-    def _authenticate(self) -> bool:
-        if self.console.authorized(self.headers.get("Authorization", "")):
-            return True
-        body = b'{"error":"authentication required"}'
-        self.send_response(HTTPStatus.UNAUTHORIZED)
-        self.send_header("WWW-Authenticate", 'Basic realm="Polymarket operator console"')
-        self._security_headers()
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-        return False
 
     def _valid_control_request(self) -> bool:
         if self.headers.get("X-Requested-With") != "poly-mm-console":
@@ -241,7 +210,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <table><thead><tr><th>Order ID</th><th>方向</th><th>价格</th><th>数量</th><th>已成交</th><th>存活秒数</th></tr></thead>
       <tbody id="orders"></tbody></table></section>
   <section class="panel"><div class="panel-head"><h2>实盘预检</h2></div><div id="preflight" class="muted">尚无预检结果</div></section>
-  <div class="foot">页面每 2 秒刷新。控制台不会返回或显示钱包私钥、API secret 或 passphrase。</div>
+  <div class="foot">页面每 2 秒刷新。控制台仅监听本机，不会返回或显示钱包私钥、API secret 或 passphrase。</div>
 </main><script>
 const $=id=>document.getElementById(id); const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function state(el,text,kind){el.textContent=text;el.className='value '+kind}

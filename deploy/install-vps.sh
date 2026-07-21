@@ -52,19 +52,6 @@ if [[ ! -e "${INSTALL_DIR}/.env" ]]; then
     "${INSTALL_DIR}/.env"
 fi
 
-# Generate a password for the loopback-only operator console without printing
-# it to stdout or shell history. Preserve a password the operator already set.
-if ! grep -q '^POLYMARKET_CONSOLE_PASSWORD=.' "${INSTALL_DIR}/.env"; then
-  console_password="$("${PYTHON_BIN}" -c 'import secrets; print(secrets.token_urlsafe(32))')"
-  if grep -q '^POLYMARKET_CONSOLE_PASSWORD=' "${INSTALL_DIR}/.env"; then
-    sed -i \
-      "s|^POLYMARKET_CONSOLE_PASSWORD=.*|POLYMARKET_CONSOLE_PASSWORD=${console_password}|" \
-      "${INSTALL_DIR}/.env"
-  else
-    printf '\nPOLYMARKET_CONSOLE_PASSWORD=%s\n' "${console_password}" >> "${INSTALL_DIR}/.env"
-  fi
-fi
-
 "${PYTHON_BIN}" -m venv "${INSTALL_DIR}/.venv"
 "${INSTALL_DIR}/.venv/bin/python" -m pip install --upgrade pip
 "${INSTALL_DIR}/.venv/bin/python" -m pip install "${INSTALL_DIR}"

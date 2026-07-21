@@ -58,7 +58,6 @@ async def async_main() -> None:
         engine,
         host=config.console_host,
         port=config.console_port,
-        password=settings.console_password,
         enabled=config.console_enabled,
     )
     console.start(loop)

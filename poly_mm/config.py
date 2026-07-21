@@ -22,7 +22,6 @@ class Settings:
     data_api_url: str = "https://data-api.polymarket.com"
     geoblock_url: str = "https://polymarket.com/api/geoblock"
     user_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
-    console_password: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -37,7 +36,6 @@ class Settings:
             order_journal_path=os.getenv(
                 "POLYMARKET_ORDER_JOURNAL_PATH", ".poly-mm-orders.json"
             ),
-            console_password=os.getenv("POLYMARKET_CONSOLE_PASSWORD") or None,
         )
 
 
