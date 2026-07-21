@@ -243,9 +243,10 @@ DASHBOARD_HTML = r"""<!doctype html>
   </section>
   <section class="panel">
     <div class="panel-head"><h2>挂单任务有效期</h2><span id="expiry-state" class="muted">不限时</span></div>
-    <div class="duration"><select id="expiry-hours" aria-label="小时"></select><span>小时</span>
-      <select id="expiry-minutes" aria-label="分钟"></select><span>分钟</span>
-      <button id="set-expiry" class="primary">设置并开始挂单</button><button id="clear-expiry">取消有效期</button></div>
+    <div class="duration"><label><input id="expiry-enabled" type="checkbox"> 启用有效期</label>
+      <select id="expiry-hours" aria-label="小时" disabled></select><span>小时</span>
+      <select id="expiry-minutes" aria-label="分钟" disabled></select><span>分钟</span>
+      <button id="apply-expiry" class="primary">应用有效期设置</button></div>
     <div class="muted" style="margin-top:10px">到期后自动暂停任务并撤销所有机器人挂单；有效期在服务重启后仍然保留。</div>
   </section>
   <section class="panel"><div class="panel-head"><h2>市场与仓位</h2></div>
@@ -258,6 +259,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   <div class="foot">页面每 2 秒刷新。控制台仅监听本机，不会返回或显示钱包私钥、API secret 或 passphrase。</div>
 </main><script>
 const $=id=>document.getElementById(id); const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let expiryFormDirty=false;
 function state(el,text,kind){el.textContent=text;el.className='value '+kind}
 function render(s){
  state($('phase'),s.phase,s.phase==='running'?'ok':s.phase==='error'?'bad':'warn');
@@ -270,18 +272,22 @@ function render(s){
  const q=s.quote_task||{}; if(q.expired){$('expiry-state').textContent='已到期 · 挂单已停止';$('expiry-state').className='bad'}
  else if(q.deadline_at){$('expiry-state').textContent=`剩余 ${formatDuration(q.remaining_seconds)} · ${new Date(q.deadline_at*1000).toLocaleString()}`;$('expiry-state').className='ok'}
  else {$('expiry-state').textContent='不限时';$('expiry-state').className='muted'}
+ if(!expiryFormDirty){$('expiry-enabled').checked=Boolean(q.deadline_at);if(q.deadline_at&&!q.expired){const totalMinutes=Math.max(1,Math.ceil(Number(q.remaining_seconds||0)/60));$('expiry-hours').value=String(Math.floor(totalMinutes/60));$('expiry-minutes').value=String(totalMinutes%60)}syncExpiryControls()}
  const p=s.preflight; $('preflight').textContent=p?`Signer ${p.signer_address} · pUSD ${p.collateral_balance} · 最小 allowance ${p.minimum_allowance} · ${p.country||'—'}/${p.region||'—'}`:'尚无预检结果';
  $('error').style.display=s.last_error?'block':'none'; $('error').textContent=s.last_error||'';
  $('updated').textContent='更新于 '+new Date().toLocaleTimeString();
 }
 function formatDuration(total){total=Math.max(0,Number(total)||0);const h=Math.floor(total/3600),m=Math.floor(total%3600/60),s=Math.floor(total%60);return `${h}小时 ${m}分 ${s}秒`}
+function syncExpiryControls(){const enabled=$('expiry-enabled').checked;$('expiry-hours').disabled=!enabled;$('expiry-minutes').disabled=!enabled}
 async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);render(await r.json())}catch(e){$('error').style.display='block';$('error').textContent='控制台连接失败：'+e.message}}
 async function action(path,confirmText,body){if(confirmText&&!confirm(confirmText))return;document.querySelectorAll('button').forEach(b=>b.disabled=true);try{const headers={'X-Requested-With':'poly-mm-console'};if(body)headers['Content-Type']='application/json';const r=await fetch(path,{method:'POST',headers,body:body?JSON.stringify(body):undefined});const j=await r.json();if(!r.ok)throw Error(j.error||`HTTP ${r.status}`);render(j.status)}catch(e){alert(e.message)}finally{document.querySelectorAll('button').forEach(b=>b.disabled=false);refresh()}}
 $('pause').onclick=()=>action('/api/pause'); $('resume').onclick=()=>action('/api/resume');
 $('cancel').onclick=()=>action('/api/cancel-all','确认紧急清空配置市场的全部订单？这也会撤销手工订单。');
 $('expiry-hours').innerHTML=Array.from({length:169},(_,i)=>`<option value="${i}">${i}</option>`).join('');$('expiry-hours').value='1';
 $('expiry-minutes').innerHTML=Array.from({length:60},(_,i)=>`<option value="${i}">${i}</option>`).join('');
-$('set-expiry').onclick=()=>action('/api/expiry',null,{hours:Number($('expiry-hours').value),minutes:Number($('expiry-minutes').value)});
-$('clear-expiry').onclick=()=>action('/api/expiry/clear');
+$('expiry-enabled').onchange=()=>{expiryFormDirty=true;syncExpiryControls()};
+$('expiry-hours').onchange=$('expiry-minutes').onchange=()=>{expiryFormDirty=true};
+$('apply-expiry').onclick=()=>{expiryFormDirty=false;if($('expiry-enabled').checked)action('/api/expiry',null,{hours:Number($('expiry-hours').value),minutes:Number($('expiry-minutes').value)});else action('/api/expiry/clear')};
+syncExpiryControls();
 refresh();setInterval(refresh,2000);
 </script></body></html>"""

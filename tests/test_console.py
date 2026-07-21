@@ -49,6 +49,12 @@ def test_console_status_and_pause_action_without_login(tmp_path) -> None:
             assert console.address is not None
             origin = f"http://127.0.0.1:{console.address[1]}"
 
+            page_request = Request(f"{origin}/")
+            status, page = await asyncio.to_thread(_read, page_request)
+            assert status == 200
+            assert 'id="expiry-enabled" type="checkbox"' in page
+            assert 'id="expiry-hours" aria-label="小时" disabled' in page
+
             status_request = Request(f"{origin}/api/status")
             status, payload = await asyncio.to_thread(_read, status_request)
             assert status == 200
