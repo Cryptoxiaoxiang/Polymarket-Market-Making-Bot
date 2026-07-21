@@ -8,6 +8,7 @@ from dataclasses import replace
 
 from poly_mm.client import PolymarketClient
 from poly_mm.config import Settings, load_config
+from poly_mm.console import ConsoleServer
 from poly_mm.discovery import resolve_market
 from poly_mm.engine import MarketMakerEngine
 
@@ -31,7 +32,11 @@ async def async_main() -> None:
                 "Resolved %s to token %s", resolved.label or resolved.outcome, resolved.token_id
             )
     config = replace(config, markets=resolved_markets)
-    client = PolymarketClient(Settings.from_env(), dry_run=False if parsed.preflight_only else config.dry_run)
+    settings = Settings.from_env()
+    client = PolymarketClient(
+        settings,
+        dry_run=False if parsed.preflight_only else config.dry_run,
+    )
     if parsed.preflight_only:
         report = await asyncio.to_thread(client.run_preflight, config)
         logging.getLogger("poly-mm").info(
@@ -49,7 +54,18 @@ async def async_main() -> None:
     loop = asyncio.get_running_loop()
     for name in ("SIGINT", "SIGTERM"):
         loop.add_signal_handler(getattr(signal, name), engine.request_stop)
-    await engine.run()
+    console = ConsoleServer(
+        engine,
+        host=config.console_host,
+        port=config.console_port,
+        password=settings.console_password,
+        enabled=config.console_enabled,
+    )
+    console.start(loop)
+    try:
+        await engine.run()
+    finally:
+        console.stop()
 
 
 def main() -> None:

@@ -4,7 +4,7 @@ import asyncio
 import logging
 from contextlib import suppress
 from decimal import Decimal
-from time import monotonic
+from time import monotonic, time
 
 from poly_mm.client import PolymarketClient
 from poly_mm.config import BotConfig
@@ -43,17 +43,26 @@ class MarketMakerEngine:
         self._user_events: asyncio.Queue[dict] = asyncio.Queue()
         self._websocket_task: asyncio.Task[None] | None = None
         self._next_position_poll_at = 0.0
+        self.paused = False
+        self.phase = "created"
+        self.started_at = time()
+        self.last_tick_at: float | None = None
+        self.last_error = ""
+        self.preflight_report = None
+        self.latest_books: dict[str, dict[str, str | bool]] = {}
 
     def request_stop(self) -> None:
         self.stop.set()
 
     async def run(self) -> None:
         logger.info("Starting Polymarket maker: dry_run=%s", self.config.dry_run)
-        self._restore_orders()
+        self.phase = "starting"
         shutdown_failures: list[str] = []
         try:
+            self._restore_orders()
             if not self.config.dry_run and self.config.preflight_enabled:
                 report = await asyncio.to_thread(self.client.run_preflight, self.config)
+                self.preflight_report = report
                 logger.info(
                     "Live preflight passed: signer=%s funder=%s pUSD=%s min_allowance=%s location=%s/%s",
                     report.signer_address,
@@ -74,11 +83,18 @@ class MarketMakerEngine:
             if not self.config.dry_run and self.config.websocket_enabled:
                 self._websocket_task = asyncio.create_task(self._watch_user_events())
 
+            self.phase = "running"
             while not self.stop.is_set():
                 await self._drain_user_events()
                 await self._tick()
                 await self._wait_for_event_or_poll()
+        except Exception as error:
+            self.phase = "error"
+            self.last_error = str(error)
+            raise
         finally:
+            if self.phase != "error":
+                self.phase = "stopping"
             if self._websocket_task is not None:
                 self._websocket_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -86,9 +102,13 @@ class MarketMakerEngine:
             if self.config.cancel_all_on_shutdown:
                 shutdown_failures = await self._cancel_all_tracked_orders()
             if shutdown_failures:
-                raise RuntimeError(
-                    "Unable to confirm cancellation for orders: " + ", ".join(shutdown_failures)
+                self.phase = "error"
+                self.last_error = "Unable to confirm cancellation for orders: " + ", ".join(
+                    shutdown_failures
                 )
+                raise RuntimeError(self.last_error)
+            if self.phase != "error":
+                self.phase = "stopped"
             logger.info("Polymarket maker stopped")
 
     def _restore_orders(self) -> None:
@@ -107,9 +127,12 @@ class MarketMakerEngine:
         self.journal.save(list(self.orders.values()))
 
     async def _tick(self) -> None:
+        self.last_tick_at = time()
         await self._reconcile_orders()
         await self._cancel_stale()
         if not await self._refresh_positions_if_due():
+            return
+        if self.paused:
             return
 
         active = list(self.orders.values())
@@ -120,6 +143,13 @@ class MarketMakerEngine:
                 continue
             try:
                 book = await asyncio.to_thread(self.client.get_orderbook, market.token_id)
+                self.latest_books[market.token_id] = {
+                    "best_bid": str(book.best_bid.price) if book.best_bid else "",
+                    "best_ask": str(book.best_ask.price) if book.best_ask else "",
+                    "spread": str(book.spread) if book.spread is not None else "",
+                    "tick_size": str(book.tick_size),
+                    "neg_risk": book.neg_risk,
+                }
                 quote = self.strategy.build_quote(market, book)
                 if quote and self.risk.approve(quote, active, self.positions):
                     order = await asyncio.to_thread(self.client.create_order, quote)
@@ -367,6 +397,77 @@ class MarketMakerEngine:
         except asyncio.TimeoutError:
             return
         await self._handle_user_event(event)
+
+    async def pause_quotes(self) -> dict:
+        """Pause new quotes and cancel every order tracked by this process."""
+        self.paused = True
+        failures = await self._cancel_all_tracked_orders()
+        if failures:
+            raise RuntimeError("Unable to confirm cancellation: " + ", ".join(failures))
+        logger.warning("Quoting paused from the local console")
+        return await self.snapshot()
+
+    async def resume_quotes(self) -> dict:
+        if self.stop.is_set():
+            raise RuntimeError("The engine is stopping and cannot resume")
+        self.paused = False
+        logger.warning("Quoting resumed from the local console")
+        return await self.snapshot()
+
+    async def emergency_cancel(self) -> dict:
+        """Pause and clear all account orders on configured tokens, including manual ones."""
+        self.paused = True
+        await self._cancel_configured_orders_on_start()
+        logger.critical("Emergency configured-token cancellation completed")
+        return await self.snapshot()
+
+    async def snapshot(self) -> dict:
+        markets = []
+        for market in self.config.enabled_markets:
+            markets.append(
+                {
+                    "label": market.label or market.outcome or market.token_id,
+                    "token_id": market.token_id,
+                    "condition_id": market.condition_id,
+                    "halted": market.token_id in self.halted_tokens,
+                    "position": str(self.positions.get(market.token_id, Decimal())),
+                    "book": self.latest_books.get(market.token_id, {}),
+                }
+            )
+        orders = [
+            {
+                "order_id": order.order_id,
+                "token_id": order.quote.token_id,
+                "side": order.quote.side.value,
+                "price": str(order.quote.price),
+                "size": str(order.quote.size),
+                "filled_size": str(order.filled_size),
+                "age_seconds": round(order.age_seconds, 1),
+            }
+            for order in self.orders.values()
+        ]
+        preflight = None
+        if self.preflight_report is not None:
+            preflight = {
+                "signer_address": self.preflight_report.signer_address,
+                "funder_address": self.preflight_report.funder_address,
+                "collateral_balance": str(self.preflight_report.collateral_balance),
+                "minimum_allowance": str(self.preflight_report.minimum_allowance),
+                "country": self.preflight_report.country,
+                "region": self.preflight_report.region,
+            }
+        return {
+            "phase": self.phase,
+            "dry_run": self.config.dry_run,
+            "paused": self.paused,
+            "websocket_connected": bool(getattr(self.client, "websocket_connected", False)),
+            "started_at": self.started_at,
+            "last_tick_at": self.last_tick_at,
+            "last_error": self.last_error,
+            "orders": orders,
+            "markets": markets,
+            "preflight": preflight,
+        }
 
 
 def _normalise_status(value: object) -> str:

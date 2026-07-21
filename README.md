@@ -67,6 +67,8 @@ API 三件套是可选的。留空时程序用私钥调用官方 SDK 的
 POLYMARKET_API_KEY=
 POLYMARKET_API_SECRET=
 POLYMARKET_API_PASSPHRASE=
+# Enables the local web console; username is admin.
+POLYMARKET_CONSOLE_PASSWORD=use-a-long-random-password
 ```
 
 ## 本地运行
@@ -95,8 +97,9 @@ cp .env.example .env
 
 ## 与 Predictfun 共用一台 VPS
 
-可以共用，而且本项目不监听端口，不会与原机器人的 HTTP 端口冲突。安全上，同一台
-VPS 被攻破会同时危及两个热钱包，因此部署脚本会使用完全独立的资源：
+可以共用。本项目只在 loopback 上监听 `8081`，不会与原机器人使用的 `8080` 冲突，
+也不会开放公网服务。安全上，同一台 VPS 被攻破会同时危及两个热钱包，因此部署脚本
+会使用完全独立的资源：
 
 | 项目 | Predictfun | Polymarket |
 |---|---|---|
@@ -127,6 +130,35 @@ sudo systemctl restart polymarket-mm-bot
 sudo journalctl -u polymarket-mm-bot -n 200 --no-pager
 ```
 
+### 网页控制台
+
+安装脚本会自动生成一个随机控制台密码并保存在
+`/opt/polymarket-mm-bot/.env`，不会将密码打印进安装日志。控制台只监听 VPS 的
+`127.0.0.1:8081`；配置解析器会拒绝把它绑定到公网地址。
+
+在自己的电脑建立 SSH 隧道：
+
+```bash
+ssh -N -L 8081:127.0.0.1:8081 your-user@your-vps
+```
+
+然后访问 <http://127.0.0.1:8081>，用户名固定为 `admin`。在 VPS 上查看自动生成的
+密码：
+
+```bash
+sudo sed -n 's/^POLYMARKET_CONSOLE_PASSWORD=//p' /opt/polymarket-mm-bot/.env
+```
+
+控制台显示引擎状态、实盘/模拟模式、User WebSocket、最近盘口、仓位、活跃订单和
+实盘预检结果，并提供：
+
+- 暂停报价并撤销机器人跟踪的订单；
+- 恢复报价；
+- 紧急撤销该账户在所有配置 token 上的订单，包括手工订单。
+
+页面和状态 API 不返回私钥、API secret 或 passphrase。所有路由均使用 HTTP Basic
+Auth，控制操作还要求同源自定义请求头以降低 CSRF 风险。
+
 不要让两个服务共享 `.env`、Linux 用户或钱包私钥。VPS 还应禁用密码 SSH、只开放
 必要端口、持续打安全补丁，并避免在 shell history、日志或备份中泄露 `.env`。
 
@@ -141,6 +173,8 @@ sudo journalctl -u polymarket-mm-bot -n 200 --no-pager
 - `position_poll_interval_seconds`：已有仓位同步间隔。
 - `cancel_after_seconds`：单笔挂单多少秒后撤销并等待下一轮重挂。
 - `cancel_retry_count` / `cancel_retry_base_seconds`：可靠撤单重试。
+- `console_enabled` / `console_host` / `console_port`：本机鉴权控制台；host 必须是
+  loopback 地址，默认 `127.0.0.1:8081`。
 - `halt_on_fill`：任何部分成交或已有仓位出现后停止该 token。
 - `cancel_all_on_start`：启动时撤销配置 token 的账户订单并确认清空。
 - `cancel_all_on_shutdown`：SIGTERM/SIGINT 时撤销所有跟踪订单。

@@ -1,0 +1,265 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import hmac
+import json
+import logging
+import threading
+from functools import partial
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Coroutine
+from urllib.parse import urlsplit
+
+from poly_mm.engine import MarketMakerEngine
+
+logger = logging.getLogger("poly-mm")
+
+
+class _ConsoleHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+class ConsoleServer:
+    """Loopback-only, password-protected operator console."""
+
+    def __init__(
+        self,
+        engine: MarketMakerEngine,
+        *,
+        host: str,
+        port: int,
+        password: str | None,
+        enabled: bool,
+    ) -> None:
+        self.engine = engine
+        self.host = host
+        self.port = port
+        self.password = password
+        self.enabled = enabled
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self._server: _ConsoleHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+        credentials = base64.b64encode(f"admin:{password or ''}".encode()).decode()
+        self._expected_authorization = f"Basic {credentials}"
+
+    @property
+    def address(self) -> tuple[str, int] | None:
+        if self._server is None:
+            return None
+        host, port = self._server.server_address[:2]
+        return str(host), int(port)
+
+    def start(self, loop: asyncio.AbstractEventLoop) -> None:
+        if not self.enabled:
+            logger.info("Local web console is disabled")
+            return
+        if not self.password:
+            logger.warning(
+                "Local web console is disabled because POLYMARKET_CONSOLE_PASSWORD is empty"
+            )
+            return
+        self.loop = loop
+        handler = partial(_ConsoleHandler, console=self)
+        self._server = _ConsoleHTTPServer((self.host, self.port), handler)
+        self._thread = threading.Thread(
+            target=self._server.serve_forever,
+            name="poly-mm-console",
+            daemon=True,
+        )
+        self._thread.start()
+        logger.info("Local web console listening on http://%s:%s", *self.address)
+
+    def stop(self) -> None:
+        if self._server is None:
+            return
+        self._server.shutdown()
+        self._server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        self._server = None
+        self._thread = None
+
+    def authorized(self, value: str) -> bool:
+        return hmac.compare_digest(value, self._expected_authorization)
+
+    def run(self, coroutine: Coroutine, timeout: float = 30) -> dict:
+        if self.loop is None or not self.loop.is_running():
+            coroutine.close()
+            raise RuntimeError("Engine event loop is unavailable")
+        future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
+        return future.result(timeout=timeout)
+
+
+class _ConsoleHandler(BaseHTTPRequestHandler):
+    server_version = "PolyMMConsole/1"
+
+    def __init__(self, *args, console: ConsoleServer, **kwargs) -> None:
+        self.console = console
+        super().__init__(*args, **kwargs)
+
+    def do_GET(self) -> None:  # noqa: N802
+        if not self._authenticate():
+            return
+        path = urlsplit(self.path).path
+        if path == "/":
+            self._send(HTTPStatus.OK, DASHBOARD_HTML.encode(), "text/html; charset=utf-8")
+        elif path == "/api/status":
+            try:
+                self._send_json(HTTPStatus.OK, self.console.run(self.console.engine.snapshot(), 5))
+            except Exception as error:
+                self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(error)})
+        elif path == "/healthz":
+            self._send_json(HTTPStatus.OK, {"ok": True})
+        else:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        if not self._authenticate():
+            return
+        if not self._valid_control_request():
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "invalid control request"})
+            return
+        path = urlsplit(self.path).path
+        actions = {
+            "/api/pause": self.console.engine.pause_quotes,
+            "/api/resume": self.console.engine.resume_quotes,
+            "/api/cancel-all": self.console.engine.emergency_cancel,
+        }
+        action = actions.get(path)
+        if action is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            return
+        try:
+            result = self.console.run(action())
+            self._send_json(HTTPStatus.OK, {"ok": True, "status": result})
+        except Exception as error:
+            logger.warning("Console action %s failed: %s", path, error)
+            self._send_json(HTTPStatus.CONFLICT, {"error": str(error)})
+
+    def _authenticate(self) -> bool:
+        if self.console.authorized(self.headers.get("Authorization", "")):
+            return True
+        body = b'{"error":"authentication required"}'
+        self.send_response(HTTPStatus.UNAUTHORIZED)
+        self.send_header("WWW-Authenticate", 'Basic realm="Polymarket operator console"')
+        self._security_headers()
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return False
+
+    def _valid_control_request(self) -> bool:
+        if self.headers.get("X-Requested-With") != "poly-mm-console":
+            return False
+        origin = self.headers.get("Origin")
+        host = self.headers.get("Host")
+        return not origin or (bool(host) and origin == f"http://{host}")
+
+    def _send_json(self, status: HTTPStatus, payload: dict) -> None:
+        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
+        self._send(status, body, "application/json; charset=utf-8")
+
+    def _send(self, status: HTTPStatus, body: bytes, content_type: str) -> None:
+        self.send_response(status)
+        self._security_headers()
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _security_headers(self) -> None:
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
+        )
+
+    def log_message(self, format: str, *args) -> None:
+        logger.debug("Console %s - %s", self.address_string(), format % args)
+
+
+DASHBOARD_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Polymarket 做市控制台</title>
+  <style>
+    :root { color-scheme: dark; --bg:#080b12; --panel:#111827; --line:#263247;
+      --muted:#91a0b8; --text:#eef4ff; --cyan:#45d9c5; --amber:#ffbd5b; --red:#ff6b78; }
+    * { box-sizing:border-box } body { margin:0; font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+      color:var(--text); background:radial-gradient(circle at 12% 0,#13243a 0,transparent 34%),var(--bg); }
+    main { max-width:1180px; margin:auto; padding:28px 20px 52px } header { display:flex; gap:16px;
+      align-items:flex-end; justify-content:space-between; margin-bottom:22px } h1 { margin:0; font-size:25px }
+    .subtitle,.muted { color:var(--muted) } .grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px }
+    .card,.panel { border:1px solid var(--line); background:rgba(17,24,39,.88); border-radius:14px;
+      box-shadow:0 14px 40px rgba(0,0,0,.18) } .card { padding:15px } .label { color:var(--muted); font-size:12px }
+    .value { margin-top:7px; font-size:18px; font-weight:700 } .ok { color:var(--cyan) } .warn { color:var(--amber) }
+    .bad { color:var(--red) } .panel { margin-top:14px; padding:18px } .panel-head { display:flex;
+      align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px } h2 { margin:0; font-size:16px }
+    .actions { display:flex; gap:8px; flex-wrap:wrap } button { border:1px solid var(--line); border-radius:9px;
+      padding:9px 13px; color:var(--text); background:#182338; cursor:pointer; font:inherit } button:hover { border-color:#5c708f }
+    button.primary { color:#061713; background:var(--cyan); border-color:var(--cyan) } button.danger { color:#250509;
+      background:var(--red); border-color:var(--red) } button:disabled { opacity:.45; cursor:wait }
+    table { width:100%; border-collapse:collapse } th,td { text-align:left; padding:10px 8px; border-bottom:1px solid var(--line) }
+    th { color:var(--muted); font-size:11px; text-transform:uppercase } td.token { max-width:250px; overflow:hidden;
+      text-overflow:ellipsis; white-space:nowrap } .empty { padding:18px 8px; color:var(--muted) }
+    .error { display:none; margin-bottom:14px; padding:11px 14px; border:1px solid #71313a; border-radius:10px;
+      color:#ffacb4; background:#261117 } .foot { margin-top:18px; color:var(--muted); font-size:12px }
+    @media(max-width:800px){.grid{grid-template-columns:repeat(2,1fr)} header{align-items:flex-start;flex-direction:column}}
+    @media(max-width:520px){.grid{grid-template-columns:1fr}.panel{overflow:auto}main{padding:20px 12px}}
+  </style>
+</head>
+<body><main>
+  <header><div><h1>POLYMARKET / MAKER</h1><div class="subtitle">本机操作控制台 · 127.0.0.1</div></div>
+    <div id="updated" class="muted">正在连接…</div></header>
+  <div id="error" class="error"></div>
+  <section class="grid">
+    <div class="card"><div class="label">引擎状态</div><div id="phase" class="value">—</div></div>
+    <div class="card"><div class="label">交易模式</div><div id="mode" class="value">—</div></div>
+    <div class="card"><div class="label">报价开关</div><div id="paused" class="value">—</div></div>
+    <div class="card"><div class="label">用户 WebSocket</div><div id="ws" class="value">—</div></div>
+  </section>
+  <section class="panel">
+    <div class="panel-head"><h2>操作</h2><div class="actions">
+      <button id="pause">暂停并撤销机器人订单</button><button id="resume" class="primary">恢复报价</button>
+      <button id="cancel" class="danger">紧急清空配置市场订单</button></div></div>
+    <div class="muted">紧急清场也会撤销当前账户在配置 token 上的手工订单。</div>
+  </section>
+  <section class="panel"><div class="panel-head"><h2>市场与仓位</h2></div>
+    <table><thead><tr><th>市场</th><th>仓位</th><th>Bid</th><th>Ask</th><th>Spread</th><th>状态</th></tr></thead>
+      <tbody id="markets"></tbody></table></section>
+  <section class="panel"><div class="panel-head"><h2>活跃订单</h2><span id="order-count" class="muted"></span></div>
+    <table><thead><tr><th>Order ID</th><th>方向</th><th>价格</th><th>数量</th><th>已成交</th><th>存活秒数</th></tr></thead>
+      <tbody id="orders"></tbody></table></section>
+  <section class="panel"><div class="panel-head"><h2>实盘预检</h2></div><div id="preflight" class="muted">尚无预检结果</div></section>
+  <div class="foot">页面每 2 秒刷新。控制台不会返回或显示钱包私钥、API secret 或 passphrase。</div>
+</main><script>
+const $=id=>document.getElementById(id); const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function state(el,text,kind){el.textContent=text;el.className='value '+kind}
+function render(s){
+ state($('phase'),s.phase,s.phase==='running'?'ok':s.phase==='error'?'bad':'warn');
+ state($('mode'),s.dry_run?'DRY-RUN':'LIVE',s.dry_run?'warn':'bad');
+ state($('paused'),s.paused?'已暂停':'正在报价',s.paused?'warn':'ok');
+ state($('ws'),s.websocket_connected?'已连接':(s.dry_run?'未启用':'未连接'),s.websocket_connected?'ok':'warn');
+ $('markets').innerHTML=s.markets.length?s.markets.map(m=>`<tr><td>${esc(m.label)}</td><td>${esc(m.position)}</td><td>${esc(m.book.best_bid||'—')}</td><td>${esc(m.book.best_ask||'—')}</td><td>${esc(m.book.spread||'—')}</td><td class="${m.halted?'bad':'ok'}">${m.halted?'HALTED':'ACTIVE'}</td></tr>`).join(''):'<tr><td colspan="6" class="empty">无市场</td></tr>';
+ $('orders').innerHTML=s.orders.length?s.orders.map(o=>`<tr><td class="token" title="${esc(o.order_id)}">${esc(o.order_id)}</td><td>${esc(o.side)}</td><td>${esc(o.price)}</td><td>${esc(o.size)}</td><td>${esc(o.filled_size)}</td><td>${esc(o.age_seconds)}</td></tr>`).join(''):'<tr><td colspan="6" class="empty">当前没有活跃订单</td></tr>';
+ $('order-count').textContent=`${s.orders.length} orders`;
+ const p=s.preflight; $('preflight').textContent=p?`Signer ${p.signer_address} · pUSD ${p.collateral_balance} · 最小 allowance ${p.minimum_allowance} · ${p.country||'—'}/${p.region||'—'}`:'尚无预检结果';
+ $('error').style.display=s.last_error?'block':'none'; $('error').textContent=s.last_error||'';
+ $('updated').textContent='更新于 '+new Date().toLocaleTimeString();
+}
+async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);render(await r.json())}catch(e){$('error').style.display='block';$('error').textContent='控制台连接失败：'+e.message}}
+async function action(path,confirmText){if(confirmText&&!confirm(confirmText))return;document.querySelectorAll('button').forEach(b=>b.disabled=true);try{const r=await fetch(path,{method:'POST',headers:{'X-Requested-With':'poly-mm-console'}});const j=await r.json();if(!r.ok)throw Error(j.error||`HTTP ${r.status}`);render(j.status)}catch(e){alert(e.message)}finally{document.querySelectorAll('button').forEach(b=>b.disabled=false);refresh()}}
+$('pause').onclick=()=>action('/api/pause'); $('resume').onclick=()=>action('/api/resume');
+$('cancel').onclick=()=>action('/api/cancel-all','确认紧急清空配置市场的全部订单？这也会撤销手工订单。');
+refresh();setInterval(refresh,2000);
+</script></body></html>"""

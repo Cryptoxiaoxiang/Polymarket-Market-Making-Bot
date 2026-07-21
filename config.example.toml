@@ -14,6 +14,10 @@ websocket_enabled = true
 position_poll_interval_seconds = 5.0
 cancel_retry_count = 4
 cancel_retry_base_seconds = 0.5
+# The console is deliberately restricted to the local loopback interface.
+console_enabled = true
+console_host = "127.0.0.1"
+console_port = 8081
 
 [[markets]]
 # Paste a Polymarket event/market URL and select an outcome. The bot resolves

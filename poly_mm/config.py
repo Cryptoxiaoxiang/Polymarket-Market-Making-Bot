@@ -4,6 +4,7 @@ import os
 import tomllib
 from dataclasses import dataclass, field
 from decimal import Decimal
+from ipaddress import ip_address
 from pathlib import Path
 
 
@@ -21,6 +22,7 @@ class Settings:
     data_api_url: str = "https://data-api.polymarket.com"
     geoblock_url: str = "https://polymarket.com/api/geoblock"
     user_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+    console_password: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -35,6 +37,7 @@ class Settings:
             order_journal_path=os.getenv(
                 "POLYMARKET_ORDER_JOURNAL_PATH", ".poly-mm-orders.json"
             ),
+            console_password=os.getenv("POLYMARKET_CONSOLE_PASSWORD") or None,
         )
 
 
@@ -80,6 +83,9 @@ class BotConfig:
     position_poll_interval_seconds: float = 5
     cancel_retry_count: int = 4
     cancel_retry_base_seconds: float = 0.5
+    console_enabled: bool = True
+    console_host: str = "127.0.0.1"
+    console_port: int = 8081
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     markets: list[MarketConfig] = field(default_factory=list)
@@ -119,6 +125,9 @@ def load_config(path: str | Path) -> BotConfig:
         ),
         cancel_retry_count=int(data.get("cancel_retry_count", 4)),
         cancel_retry_base_seconds=float(data.get("cancel_retry_base_seconds", 0.5)),
+        console_enabled=bool(data.get("console_enabled", True)),
+        console_host=str(data.get("console_host", "127.0.0.1")),
+        console_port=int(data.get("console_port", 8081)),
         strategy=strategy,
         risk=risk,
         markets=markets,
@@ -136,6 +145,15 @@ def load_config(path: str | Path) -> BotConfig:
         raise ValueError("cancel_retry_count must be at least 1")
     if config.cancel_retry_base_seconds < 0:
         raise ValueError("cancel_retry_base_seconds cannot be negative")
+    if config.console_enabled:
+        try:
+            is_loopback = ip_address(config.console_host).is_loopback
+        except ValueError as error:
+            raise ValueError("console_host must be a numeric loopback address") from error
+        if not is_loopback:
+            raise ValueError("console_host must be a loopback address")
+        if not 1 <= config.console_port <= 65535:
+            raise ValueError("console_port must be between 1 and 65535")
     if config.strategy.quote_size <= 0:
         raise ValueError("strategy.quote_size must be positive")
     if config.strategy.min_edge_ticks < 0:
