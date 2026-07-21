@@ -1,5 +1,6 @@
 import asyncio
 from decimal import Decimal
+from time import time
 from types import SimpleNamespace
 
 from poly_mm.config import BotConfig, MarketConfig
@@ -120,3 +121,37 @@ def test_websocket_partial_fill_halts_token_and_cancels_order(tmp_path) -> None:
     assert client.cancelled == ["order-1"]
     assert engine.orders == {}
     assert OrderJournal(tmp_path / "orders.json").load() == []
+
+
+def test_expired_quote_task_pauses_cancels_and_survives_restart(tmp_path) -> None:
+    journal = OrderJournal(tmp_path / "orders.json")
+    client = FakeClient(journal.path)
+    client.open_orders = [{"id": "order-1"}]
+    engine = MarketMakerEngine(_config(), client, journal)
+    engine.orders = {"order-1": _order()}
+    engine.quote_deadline_at = time() - 1
+
+    expired = asyncio.run(engine._expire_quote_task_if_due())
+
+    assert expired is True
+    assert engine.paused is True
+    assert engine.quote_task_expired is True
+    assert client.cancelled == ["order-1"]
+    assert journal.load() == []
+
+    restored = MarketMakerEngine(_config(), FakeClient(journal.path), journal)
+    restored._restore_orders()
+    assert restored.paused is True
+    assert restored.quote_task_expired is True
+
+
+def test_setting_new_validity_resumes_an_expired_task(tmp_path) -> None:
+    engine = MarketMakerEngine(_config(), FakeClient(tmp_path / "orders.json"))
+    engine.paused = True
+    engine.quote_task_expired = True
+
+    snapshot = asyncio.run(engine.set_quote_expiry(1, 30))
+
+    assert engine.paused is False
+    assert engine.quote_task_expired is False
+    assert 5_390 <= snapshot["quote_task"]["remaining_seconds"] <= 5_400

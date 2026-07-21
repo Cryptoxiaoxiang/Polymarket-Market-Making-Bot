@@ -14,8 +14,9 @@ def test_journal_round_trip_and_private_permissions(tmp_path) -> None:
         Decimal("1.5"),
     )
 
-    journal.save([order])
+    journal.save([order], quote_deadline_at=1_800_000_000)
     restored = journal.load()
 
     assert restored == [order]
+    assert journal.load_quote_deadline() == 1_800_000_000
     assert path.stat().st_mode & 0o777 == 0o600

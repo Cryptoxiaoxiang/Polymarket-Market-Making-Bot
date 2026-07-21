@@ -14,6 +14,7 @@ from poly_mm.risk import RiskManager
 from poly_mm.strategy import PassiveMakerStrategy
 
 logger = logging.getLogger("poly-mm")
+MAX_QUOTE_DURATION_SECONDS = 7 * 24 * 60 * 60
 OPEN_ORDER_STATUSES = {"LIVE", "OPEN", "DELAYED", "UNMATCHED"}
 TERMINAL_ORDER_STATUSES = {
     "CANCELED",
@@ -50,6 +51,8 @@ class MarketMakerEngine:
         self.last_error = ""
         self.preflight_report = None
         self.latest_books: dict[str, dict[str, str | bool]] = {}
+        self.quote_deadline_at: float | None = None
+        self.quote_task_expired = False
 
     def request_stop(self) -> None:
         self.stop.set()
@@ -118,16 +121,25 @@ class MarketMakerEngine:
             return
         restored = self.journal.load()
         self.orders = {order.order_id: order for order in restored}
+        self.quote_deadline_at = self.journal.load_quote_deadline()
+        if self.quote_deadline_at is not None and self.quote_deadline_at <= time():
+            self.quote_task_expired = True
+            self.paused = True
+            logger.warning("Restored quote-task deadline has expired; quoting remains paused")
         if restored:
             logger.warning("Restored %d tracked order(s) from the crash journal", len(restored))
 
     def _persist_orders(self) -> None:
         if self.config.dry_run:
             return
-        self.journal.save(list(self.orders.values()))
+        self.journal.save(
+            list(self.orders.values()),
+            quote_deadline_at=self.quote_deadline_at,
+        )
 
     async def _tick(self) -> None:
         self.last_tick_at = time()
+        await self._expire_quote_task_if_due()
         await self._reconcile_orders()
         await self._cancel_stale()
         if not await self._refresh_positions_if_due():
@@ -410,9 +422,58 @@ class MarketMakerEngine:
     async def resume_quotes(self) -> dict:
         if self.stop.is_set():
             raise RuntimeError("The engine is stopping and cannot resume")
+        if self.quote_task_expired or (
+            self.quote_deadline_at is not None and self.quote_deadline_at <= time()
+        ):
+            raise RuntimeError("The quote task has expired; set a new validity period first")
         self.paused = False
         logger.warning("Quoting resumed from the local console")
         return await self.snapshot()
+
+    async def set_quote_expiry(self, hours: int, minutes: int) -> dict:
+        if isinstance(hours, bool) or isinstance(minutes, bool):
+            raise ValueError("Hours and minutes must be integers")
+        if not isinstance(hours, int) or not isinstance(minutes, int):
+            raise ValueError("Hours and minutes must be integers")
+        if not 0 <= hours <= 168 or not 0 <= minutes <= 59:
+            raise ValueError("Validity must be between 1 minute and 7 days")
+        duration_seconds = (hours * 60 + minutes) * 60
+        if not 60 <= duration_seconds <= MAX_QUOTE_DURATION_SECONDS:
+            raise ValueError("Validity must be between 1 minute and 7 days")
+        if self.stop.is_set():
+            raise RuntimeError("The engine is stopping and cannot start a quote task")
+        self.quote_deadline_at = time() + duration_seconds
+        self.quote_task_expired = False
+        self.paused = False
+        self._persist_orders()
+        logger.warning("Quote-task validity set to %dh %dm; quoting enabled", hours, minutes)
+        return await self.snapshot()
+
+    async def clear_quote_expiry(self) -> dict:
+        self.quote_deadline_at = None
+        self.quote_task_expired = False
+        self._persist_orders()
+        logger.warning("Quote-task validity cleared; current pause state is unchanged")
+        return await self.snapshot()
+
+    async def _expire_quote_task_if_due(self) -> bool:
+        if self.quote_deadline_at is None or self.quote_deadline_at > time():
+            return False
+        first_expiration = not self.quote_task_expired
+        self.quote_task_expired = True
+        self.paused = True
+        self._persist_orders()
+        failures = await self._cancel_all_tracked_orders()
+        expiration_error_prefix = "Expired quote task could not cancel orders: "
+        if failures:
+            self.last_error = expiration_error_prefix + ", ".join(failures)
+            logger.critical(self.last_error)
+        else:
+            if self.last_error.startswith(expiration_error_prefix):
+                self.last_error = ""
+            if first_expiration:
+                logger.critical("Quote-task validity expired; all tracked orders canceled")
+        return True
 
     async def emergency_cancel(self) -> dict:
         """Pause and clear all account orders on configured tokens, including manual ones."""
@@ -467,6 +528,15 @@ class MarketMakerEngine:
             "orders": orders,
             "markets": markets,
             "preflight": preflight,
+            "quote_task": {
+                "deadline_at": self.quote_deadline_at,
+                "remaining_seconds": (
+                    max(0, int(self.quote_deadline_at - time()))
+                    if self.quote_deadline_at is not None
+                    else None
+                ),
+                "expired": self.quote_task_expired,
+            },
         }
 
 

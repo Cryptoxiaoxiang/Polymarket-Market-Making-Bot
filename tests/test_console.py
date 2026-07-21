@@ -71,6 +71,47 @@ def test_console_status_and_pause_action_without_login(tmp_path) -> None:
             status, payload = await asyncio.to_thread(_read, pause)
             assert status == 200
             assert payload["status"]["paused"] is True
+
+            invalid_expiry = Request(
+                f"{origin}/api/expiry",
+                data=json.dumps({"hours": 0, "minutes": 0}).encode(),
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "Origin": origin,
+                    "X-Requested-With": "poly-mm-console",
+                },
+            )
+            status, payload = await asyncio.to_thread(_read, invalid_expiry)
+            assert status == 400
+            assert "1 minute" in payload["error"]
+
+            expiry = Request(
+                f"{origin}/api/expiry",
+                data=json.dumps({"hours": 2, "minutes": 15}).encode(),
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "Origin": origin,
+                    "X-Requested-With": "poly-mm-console",
+                },
+            )
+            status, payload = await asyncio.to_thread(_read, expiry)
+            assert status == 200
+            assert payload["status"]["paused"] is False
+            assert 8_090 <= payload["status"]["quote_task"]["remaining_seconds"] <= 8_100
+
+            clear = Request(
+                f"{origin}/api/expiry/clear",
+                method="POST",
+                headers={
+                    "Origin": origin,
+                    "X-Requested-With": "poly-mm-console",
+                },
+            )
+            status, payload = await asyncio.to_thread(_read, clear)
+            assert status == 200
+            assert payload["status"]["quote_task"]["deadline_at"] is None
         finally:
             console.stop()
 

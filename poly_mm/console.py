@@ -105,6 +105,29 @@ class _ConsoleHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "invalid control request"})
             return
         path = urlsplit(self.path).path
+        if path == "/api/expiry":
+            try:
+                payload = self._read_json_body()
+                result = self.console.run(
+                    self.console.engine.set_quote_expiry(
+                        payload.get("hours"), payload.get("minutes")
+                    )
+                )
+                self._send_json(HTTPStatus.OK, {"ok": True, "status": result})
+            except ValueError as error:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            except Exception as error:
+                logger.warning("Console expiry action failed: %s", error)
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(error)})
+            return
+        if path == "/api/expiry/clear":
+            try:
+                result = self.console.run(self.console.engine.clear_quote_expiry())
+                self._send_json(HTTPStatus.OK, {"ok": True, "status": result})
+            except Exception as error:
+                logger.warning("Console clear-expiry action failed: %s", error)
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(error)})
+            return
         actions = {
             "/api/pause": self.console.engine.pause_quotes,
             "/api/resume": self.console.engine.resume_quotes,
@@ -120,6 +143,21 @@ class _ConsoleHandler(BaseHTTPRequestHandler):
         except Exception as error:
             logger.warning("Console action %s failed: %s", path, error)
             self._send_json(HTTPStatus.CONFLICT, {"error": str(error)})
+
+    def _read_json_body(self) -> dict:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as error:
+            raise ValueError("Invalid request length") from error
+        if not 1 <= length <= 2048:
+            raise ValueError("Invalid request body")
+        try:
+            payload = json.loads(self.rfile.read(length))
+        except json.JSONDecodeError as error:
+            raise ValueError("Invalid JSON body") from error
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object")
+        return payload
 
     def _valid_control_request(self) -> bool:
         if self.headers.get("X-Requested-With") != "poly-mm-console":
@@ -174,7 +212,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     .value { margin-top:7px; font-size:18px; font-weight:700 } .ok { color:var(--cyan) } .warn { color:var(--amber) }
     .bad { color:var(--red) } .panel { margin-top:14px; padding:18px } .panel-head { display:flex;
       align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px } h2 { margin:0; font-size:16px }
-    .actions { display:flex; gap:8px; flex-wrap:wrap } button { border:1px solid var(--line); border-radius:9px;
+    .actions,.duration { display:flex; gap:8px; flex-wrap:wrap; align-items:center } button,select { border:1px solid var(--line); border-radius:9px;
       padding:9px 13px; color:var(--text); background:#182338; cursor:pointer; font:inherit } button:hover { border-color:#5c708f }
     button.primary { color:#061713; background:var(--cyan); border-color:var(--cyan) } button.danger { color:#250509;
       background:var(--red); border-color:var(--red) } button:disabled { opacity:.45; cursor:wait }
@@ -203,6 +241,13 @@ DASHBOARD_HTML = r"""<!doctype html>
       <button id="cancel" class="danger">紧急清空配置市场订单</button></div></div>
     <div class="muted">紧急清场也会撤销当前账户在配置 token 上的手工订单。</div>
   </section>
+  <section class="panel">
+    <div class="panel-head"><h2>挂单任务有效期</h2><span id="expiry-state" class="muted">不限时</span></div>
+    <div class="duration"><select id="expiry-hours" aria-label="小时"></select><span>小时</span>
+      <select id="expiry-minutes" aria-label="分钟"></select><span>分钟</span>
+      <button id="set-expiry" class="primary">设置并开始挂单</button><button id="clear-expiry">取消有效期</button></div>
+    <div class="muted" style="margin-top:10px">到期后自动暂停任务并撤销所有机器人挂单；有效期在服务重启后仍然保留。</div>
+  </section>
   <section class="panel"><div class="panel-head"><h2>市场与仓位</h2></div>
     <table><thead><tr><th>市场</th><th>仓位</th><th>Bid</th><th>Ask</th><th>Spread</th><th>状态</th></tr></thead>
       <tbody id="markets"></tbody></table></section>
@@ -222,13 +267,21 @@ function render(s){
  $('markets').innerHTML=s.markets.length?s.markets.map(m=>`<tr><td>${esc(m.label)}</td><td>${esc(m.position)}</td><td>${esc(m.book.best_bid||'—')}</td><td>${esc(m.book.best_ask||'—')}</td><td>${esc(m.book.spread||'—')}</td><td class="${m.halted?'bad':'ok'}">${m.halted?'HALTED':'ACTIVE'}</td></tr>`).join(''):'<tr><td colspan="6" class="empty">无市场</td></tr>';
  $('orders').innerHTML=s.orders.length?s.orders.map(o=>`<tr><td class="token" title="${esc(o.order_id)}">${esc(o.order_id)}</td><td>${esc(o.side)}</td><td>${esc(o.price)}</td><td>${esc(o.size)}</td><td>${esc(o.filled_size)}</td><td>${esc(o.age_seconds)}</td></tr>`).join(''):'<tr><td colspan="6" class="empty">当前没有活跃订单</td></tr>';
  $('order-count').textContent=`${s.orders.length} orders`;
+ const q=s.quote_task||{}; if(q.expired){$('expiry-state').textContent='已到期 · 挂单已停止';$('expiry-state').className='bad'}
+ else if(q.deadline_at){$('expiry-state').textContent=`剩余 ${formatDuration(q.remaining_seconds)} · ${new Date(q.deadline_at*1000).toLocaleString()}`;$('expiry-state').className='ok'}
+ else {$('expiry-state').textContent='不限时';$('expiry-state').className='muted'}
  const p=s.preflight; $('preflight').textContent=p?`Signer ${p.signer_address} · pUSD ${p.collateral_balance} · 最小 allowance ${p.minimum_allowance} · ${p.country||'—'}/${p.region||'—'}`:'尚无预检结果';
  $('error').style.display=s.last_error?'block':'none'; $('error').textContent=s.last_error||'';
  $('updated').textContent='更新于 '+new Date().toLocaleTimeString();
 }
+function formatDuration(total){total=Math.max(0,Number(total)||0);const h=Math.floor(total/3600),m=Math.floor(total%3600/60),s=Math.floor(total%60);return `${h}小时 ${m}分 ${s}秒`}
 async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw Error(`HTTP ${r.status}`);render(await r.json())}catch(e){$('error').style.display='block';$('error').textContent='控制台连接失败：'+e.message}}
-async function action(path,confirmText){if(confirmText&&!confirm(confirmText))return;document.querySelectorAll('button').forEach(b=>b.disabled=true);try{const r=await fetch(path,{method:'POST',headers:{'X-Requested-With':'poly-mm-console'}});const j=await r.json();if(!r.ok)throw Error(j.error||`HTTP ${r.status}`);render(j.status)}catch(e){alert(e.message)}finally{document.querySelectorAll('button').forEach(b=>b.disabled=false);refresh()}}
+async function action(path,confirmText,body){if(confirmText&&!confirm(confirmText))return;document.querySelectorAll('button').forEach(b=>b.disabled=true);try{const headers={'X-Requested-With':'poly-mm-console'};if(body)headers['Content-Type']='application/json';const r=await fetch(path,{method:'POST',headers,body:body?JSON.stringify(body):undefined});const j=await r.json();if(!r.ok)throw Error(j.error||`HTTP ${r.status}`);render(j.status)}catch(e){alert(e.message)}finally{document.querySelectorAll('button').forEach(b=>b.disabled=false);refresh()}}
 $('pause').onclick=()=>action('/api/pause'); $('resume').onclick=()=>action('/api/resume');
 $('cancel').onclick=()=>action('/api/cancel-all','确认紧急清空配置市场的全部订单？这也会撤销手工订单。');
+$('expiry-hours').innerHTML=Array.from({length:169},(_,i)=>`<option value="${i}">${i}</option>`).join('');$('expiry-hours').value='1';
+$('expiry-minutes').innerHTML=Array.from({length:60},(_,i)=>`<option value="${i}">${i}</option>`).join('');
+$('set-expiry').onclick=()=>action('/api/expiry',null,{hours:Number($('expiry-hours').value),minutes:Number($('expiry-minutes').value)});
+$('clear-expiry').onclick=()=>action('/api/expiry/clear');
 refresh();setInterval(refresh,2000);
 </script></body></html>"""

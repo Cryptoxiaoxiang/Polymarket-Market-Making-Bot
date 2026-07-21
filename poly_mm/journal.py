@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -15,19 +16,51 @@ class OrderJournal:
         self.path = Path(path)
 
     def load(self) -> list[ManagedOrder]:
+        raw = self._load_payload()
+        try:
+            return [ManagedOrder.from_dict(item) for item in raw["orders"]]
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(f"Invalid order journal {self.path}: {error}") from error
+
+    def load_quote_deadline(self) -> float | None:
+        raw = self._load_payload()
+        value = raw.get("quote_deadline_at")
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise RuntimeError(f"Invalid order journal {self.path}: invalid quote deadline")
+        deadline = float(value)
+        if not math.isfinite(deadline) or deadline <= 0:
+            raise RuntimeError(f"Invalid order journal {self.path}: invalid quote deadline")
+        return deadline
+
+    def _load_payload(self) -> dict:
         if not self.path.exists():
-            return []
+            return {"version": 1, "orders": [], "quote_deadline_at": None}
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-            if raw.get("version") != 1 or not isinstance(raw.get("orders"), list):
+            if (
+                not isinstance(raw, dict)
+                or raw.get("version") != 1
+                or not isinstance(raw.get("orders"), list)
+            ):
                 raise ValueError("unsupported journal format")
-            return [ManagedOrder.from_dict(item) for item in raw["orders"]]
+            return raw
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise RuntimeError(f"Invalid order journal {self.path}: {error}") from error
 
-    def save(self, orders: list[ManagedOrder]) -> None:
+    def save(
+        self,
+        orders: list[ManagedOrder],
+        *,
+        quote_deadline_at: float | None = None,
+    ) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"version": 1, "orders": [order.to_dict() for order in orders]}
+        payload = {
+            "version": 1,
+            "orders": [order.to_dict() for order in orders],
+            "quote_deadline_at": quote_deadline_at,
+        }
         with NamedTemporaryFile(
             "w",
             encoding="utf-8",
