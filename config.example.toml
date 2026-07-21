@@ -1,0 +1,38 @@
+# Live trading is the default. Change to true when you only want a simulation.
+dry_run = false
+poll_interval_seconds = 2.0
+cancel_after_seconds = 10.0
+cancel_all_on_start = true
+cancel_all_on_shutdown = true
+# If a quote trades even partially, stop making that token. This prevents a loop
+# from rebuilding inventory while you review the fill.
+halt_on_fill = true
+# Refuse live startup if geoblock, credentials, pUSD balance, or allowances fail.
+preflight_enabled = true
+# User-channel fills are fast-path notifications; REST reconciliation remains enabled.
+websocket_enabled = true
+position_poll_interval_seconds = 5.0
+cancel_retry_count = 4
+cancel_retry_base_seconds = 0.5
+
+[[markets]]
+# Paste a Polymarket event/market URL and select an outcome. The bot resolves
+# the outcome token ID from the official Gamma API at startup.
+url = "https://polymarket.com/event/clarity-act-signed-into-law-in-2026"
+outcome = "Yes"
+label = "Clarity Act signed into law in 2026 — Yes"
+enabled = true
+quote_size = "5"
+
+[strategy]
+# Quote one tick behind the best bid by default. Set join_best_price=true to join it.
+join_best_price = false
+min_edge_ticks = 1
+min_spread = "0.01"
+max_spread = "0.15"
+
+[risk]
+max_order_size = "5"
+max_position_per_token = "5"
+max_total_open_notional = "5"
+max_open_orders_per_token = 1

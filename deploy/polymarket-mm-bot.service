@@ -1,0 +1,38 @@
+[Unit]
+Description=Polymarket passive market maker
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=polymm
+Group=polymm
+WorkingDirectory=/opt/polymarket-mm-bot
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=-/opt/polymarket-mm-bot/.env
+ExecStart=/opt/polymarket-mm-bot/.venv/bin/python -m poly_mm.main --config /opt/polymarket-mm-bot/config.toml
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=60
+UMask=0077
+
+# The process needs network access and write access only to its recovery state.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+StateDirectory=polymarket-mm-bot
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/polymarket-mm-bot
+
+[Install]
+WantedBy=multi-user.target
