@@ -10,9 +10,10 @@
 
 <https://polymarket.com/event/clarity-act-signed-into-law-in-2026>
 
-默认 `dry_run = false`，启动后会进入实盘预检，并在预检通过后签名和提交订单。如只想
-模拟，必须先手动改成 `dry_run = true`。预测市场可能产生全部本金损失；本程序不保证
-盈利。
+默认 `dry_run = false`。systemd 启动的是常驻网页控制器，不会自动启动挂单任务；用户
+需要在页面中明确点击“启动挂单任务”，随后程序才会执行实盘预检，并在通过后签名和
+提交订单。如只想模拟，必须先手动改成 `dry_run = true`。预测市场可能产生全部本金
+损失；本程序不保证盈利。
 
 ## 已实现的实盘保护
 
@@ -50,8 +51,9 @@ POLYMARKET_SIGNATURE_TYPE=0
 强制它等于私钥导出的地址。
 
 你不需要提供 Polymarket 登录密码、邮箱或助记词，也不应把私钥发给开发者或粘贴到
-聊天中。直接在 VPS 的 `/opt/polymarket-mm-bot/.env` 写入私钥即可。最好新建一个只放
-小额资金的独立 EOA，不要使用主钱包。
+聊天中。可通过 SSH 隧道打开网页控制器，在“账户设置”中直接保存；私钥和自动派生的
+L2 凭据只写入 VPS 的 `/opt/polymarket-mm-bot/.env`。也可继续在 VPS 上手工编辑该
+文件。最好新建一个只放小额资金的独立 EOA，不要使用主钱包。
 
 实盘还需要：
 
@@ -110,16 +112,13 @@ cp .env.example .env
 
 ```bash
 sudo ./deploy/install-vps.sh
-sudo nano /opt/polymarket-mm-bot/.env
 sudo nano /opt/polymarket-mm-bot/config.toml
-cd /opt/polymarket-mm-bot
-sudo -u polymm .venv/bin/python -m poly_mm.main --config config.toml --preflight-only
-sudo systemctl start polymarket-mm-bot
 sudo journalctl -u polymarket-mm-bot -f
 ```
 
-安装脚本首次安装只会 `enable`，不会自动启动，防止意外实盘。如果服务升级前已在
-运行，脚本会先通过 SIGTERM 让旧进程撤单，再安装并重启。常用命令：
+安装脚本会启动网页控制器，但不会自动启动交易引擎，因此不会因为安装而直接挂实盘
+订单。如果服务升级前有挂单任务在运行，脚本会先通过 SIGTERM 让旧进程撤单，再安装
+并重启网页控制器。常用命令：
 
 ```bash
 sudo systemctl status polymarket-mm-bot
@@ -144,6 +143,13 @@ ssh -N -L 8081:127.0.0.1:8081 your-user@your-vps
 控制台显示引擎状态、实盘/模拟模式、User WebSocket、最近盘口、仓位、活跃订单和
 实盘预检结果，并提供：
 
+- 在网页中保存 Private Key、钱包签名类型和 funder 地址；普通独立 EOA 选择类型
+  `0` 并让 funder 留空；
+- 保存时在 VPS 内存中校验私钥，并通过官方 SDK `create_or_derive_api_key()` 自动派生
+  L2 API key、secret 和 passphrase；页面和状态 API 只返回“是否已配置”，从不回显
+  私钥或 L2 secret；
+- 单独运行不会下单的实盘预检；
+- 明确启动或停止挂单任务；网页服务本身重启后不会自动恢复实盘任务；
 - 默认不设置有效期；勾选“启用有效期”后，可通过“小时”和“分钟”下拉框设置
   1 分钟至 7 天的挂单任务有效期；
 - 有效期到达后自动暂停新挂单并可靠撤销全部机器人订单；截止时间写入恢复状态，
@@ -156,8 +162,10 @@ ssh -N -L 8081:127.0.0.1:8081 your-user@your-vps
 当前暂停状态。已到期的任务不能直接点击“恢复报价”，必须先设置新的有效期，或取消
 勾选、应用后再恢复报价。
 
-页面和状态 API 不返回私钥、API secret 或 passphrase。控制操作仍要求同源自定义
-请求头以降低 CSRF 风险。
+账户文件由独立的 `polymm` 用户持有且权限为 `0600`。页面和状态 API 不返回私钥、
+API secret 或 passphrase，服务日志也不会记录提交内容。控制操作仍要求同源自定义
+请求头以降低 CSRF 风险。由于页面没有额外登录层，必须保持 loopback 监听并只通过
+SSH 隧道访问。
 
 不要让两个服务共享 `.env`、Linux 用户或钱包私钥。VPS 还应禁用密码 SSH、只开放
 必要端口、持续打安全补丁，并避免在 shell history、日志或备份中泄露 `.env`。

@@ -18,6 +18,18 @@ class ConsoleFakeClient:
         return []
 
 
+class AccountConsoleFakeController:
+    async def snapshot(self) -> dict:
+        return {"phase": "stopped", "account": {"private_key_set": False}}
+
+    async def save_account(self, payload: dict) -> dict:
+        assert payload["private_key"] == "test-private-key"
+        return {
+            "message": "saved",
+            "status": {"phase": "stopped", "account": {"private_key_set": True}},
+        }
+
+
 def _read(request: Request) -> tuple[int, dict | str]:
     try:
         with urlopen(request, timeout=3) as response:
@@ -54,6 +66,9 @@ def test_console_status_and_pause_action_without_login(tmp_path) -> None:
             assert status == 200
             assert 'id="expiry-enabled" type="checkbox"' in page
             assert 'id="expiry-hours" aria-label="小时" disabled' in page
+            assert 'id="account-form"' in page
+            assert 'name="private_key" type="password"' in page
+            assert 'id="start" class="primary"' in page
 
             status_request = Request(f"{origin}/api/status")
             status, payload = await asyncio.to_thread(_read, status_request)
@@ -141,3 +156,46 @@ def test_console_stays_disabled_when_config_disabled(tmp_path) -> None:
     loop.close()
 
     assert console.address is None
+
+
+def test_console_account_endpoint_requires_same_origin_control_header() -> None:
+    async def scenario() -> None:
+        console = ConsoleServer(
+            AccountConsoleFakeController(),
+            host="127.0.0.1",
+            port=0,
+            enabled=True,
+        )
+        console.start(asyncio.get_running_loop())
+        try:
+            assert console.address is not None
+            origin = f"http://127.0.0.1:{console.address[1]}"
+            body = json.dumps({"private_key": "test-private-key"}).encode()
+            rejected = Request(
+                f"{origin}/api/account",
+                data=body,
+                method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            status, payload = await asyncio.to_thread(_read, rejected)
+            assert status == 403
+            assert payload == {"error": "invalid control request"}
+
+            accepted = Request(
+                f"{origin}/api/account",
+                data=body,
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "Origin": origin,
+                    "X-Requested-With": "poly-mm-console",
+                },
+            )
+            status, payload = await asyncio.to_thread(_read, accepted)
+            assert status == 200
+            assert payload["status"]["account"]["private_key_set"] is True
+            assert "test-private-key" not in str(payload)
+        finally:
+            console.stop()
+
+    asyncio.run(scenario())

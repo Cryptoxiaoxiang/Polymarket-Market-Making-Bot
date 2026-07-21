@@ -24,8 +24,8 @@ class Settings:
     user_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
 
     @classmethod
-    def from_env(cls) -> "Settings":
-        _load_dotenv(Path(".env"))
+    def from_env(cls, path: str | Path = ".env") -> "Settings":
+        _load_dotenv(Path(path))
         return cls(
             private_key=os.getenv("POLYMARKET_PRIVATE_KEY") or None,
             funder=os.getenv("POLYMARKET_FUNDER_ADDRESS") or None,
@@ -189,3 +189,30 @@ def _load_dotenv(path: Path) -> None:
         if "=" in line and not line.lstrip().startswith("#"):
             key, value = line.split("=", 1)
             os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+
+
+def update_dotenv_values(path: str | Path, updates: dict[str, str]) -> None:
+    """Update selected dotenv values without exposing or discarding unrelated settings."""
+    env_path = Path(path)
+    for key, value in updates.items():
+        if not key or any(character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_" for character in key):
+            raise ValueError(f"Invalid environment variable name: {key}")
+        if "\n" in value or "\r" in value or "\0" in value:
+            raise ValueError(f"Invalid value for {key}")
+
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    remaining = dict(updates)
+    result: list[str] = []
+    for line in lines:
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            result.append(line)
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key in remaining:
+            result.append(f"{key}={remaining.pop(key)}")
+        else:
+            result.append(line)
+    result.extend(f"{key}={value}" for key, value in remaining.items())
+    env_path.write_text("\n".join(result) + "\n", encoding="utf-8")
+    env_path.chmod(0o600)

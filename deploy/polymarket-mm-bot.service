@@ -13,8 +13,8 @@ WorkingDirectory=/opt/polymarket-mm-bot
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 EnvironmentFile=-/opt/polymarket-mm-bot/.env
-ExecStart=/opt/polymarket-mm-bot/.venv/bin/python -m poly_mm.main --config /opt/polymarket-mm-bot/config.toml
-Restart=on-failure
+ExecStart=/opt/polymarket-mm-bot/.venv/bin/python -m poly_mm.web --config /opt/polymarket-mm-bot/config.toml --env /opt/polymarket-mm-bot/.env
+Restart=always
 RestartSec=10
 KillSignal=SIGTERM
 TimeoutStopSec=60
@@ -32,7 +32,7 @@ RestrictSUIDSGID=true
 LockPersonality=true
 StateDirectory=polymarket-mm-bot
 StateDirectoryMode=0700
-ReadWritePaths=/var/lib/polymarket-mm-bot
+ReadWritePaths=/var/lib/polymarket-mm-bot /opt/polymarket-mm-bot/.env
 
 [Install]
 WantedBy=multi-user.target

@@ -63,8 +63,10 @@ chown root:root \
   "${INSTALL_DIR}/README.md" \
   "${INSTALL_DIR}/config.example.toml" \
   "${INSTALL_DIR}/.env.example"
-chown root:"${SERVICE_USER}" "${INSTALL_DIR}/config.toml" "${INSTALL_DIR}/.env"
-chmod 0640 "${INSTALL_DIR}/config.toml" "${INSTALL_DIR}/.env"
+chown root:"${SERVICE_USER}" "${INSTALL_DIR}/config.toml"
+chmod 0640 "${INSTALL_DIR}/config.toml"
+chown "${SERVICE_USER}":"${SERVICE_USER}" "${INSTALL_DIR}/.env"
+chmod 0600 "${INSTALL_DIR}/.env"
 
 install -o root -g root -m 0644 \
   "${SOURCE_DIR}/deploy/polymarket-mm-bot.service" \
@@ -72,10 +74,10 @@ install -o root -g root -m 0644 \
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}.service"
 
+systemctl start "${SERVICE_NAME}.service"
 if [[ "${was_active}" -eq 1 ]]; then
-  systemctl start "${SERVICE_NAME}.service"
   echo "Updated and restarted ${SERVICE_NAME}.service"
 else
-  echo "Installed ${SERVICE_NAME}.service but did not start it."
-  echo "Edit ${INSTALL_DIR}/.env and ${INSTALL_DIR}/config.toml, run preflight, then start it."
+  echo "Installed and started the ${SERVICE_NAME}.service web controller."
+  echo "Open the loopback-only console to configure the account and start the trading task."
 fi
