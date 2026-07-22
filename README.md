@@ -111,13 +111,15 @@ cp .env.example .env
 
 ```bash
 sudo ./deploy/install-vps.sh
-sudo nano /opt/polymarket-mm-bot/config.toml
+sudo nano /var/lib/polymarket-mm-bot/config.toml
 sudo journalctl -u polymarket-mm-bot -f
 ```
 
 安装脚本会启动网页控制器，但不会自动启动交易引擎，因此不会因为安装而直接挂实盘
 订单。如果服务升级前有挂单任务在运行，脚本会先通过 SIGTERM 让旧进程撤单，再安装
-并重启网页控制器。常用命令：
+并重启网页控制器。网页可编辑的运行配置保存在
+`/var/lib/polymarket-mm-bot/config.toml`；首次升级时会自动从旧的
+`/opt/polymarket-mm-bot/config.toml` 复制，账户 `.env` 和已有设置不会被覆盖。常用命令：
 
 ```bash
 sudo systemctl status polymarket-mm-bot
