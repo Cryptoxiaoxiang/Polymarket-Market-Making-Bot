@@ -1,6 +1,9 @@
 import pytest
 
-from poly_mm.config import load_config, update_dotenv_values
+from dataclasses import replace
+from decimal import Decimal
+
+from poly_mm.config import BotConfig, MarketConfig, load_config, update_dotenv_values, write_config
 
 
 def test_example_config_defaults_to_live_trading() -> None:
@@ -43,3 +46,33 @@ def test_update_dotenv_values_preserves_unrelated_settings(tmp_path) -> None:
         "# account\nSECRET=new\nKEEP=value\nADDED=value\n"
     )
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_write_config_round_trips_web_setup_without_secrets(tmp_path) -> None:
+    path = tmp_path / "config.toml"
+    config = BotConfig(
+        run_duration_seconds=5_400,
+        markets=[
+            MarketConfig(
+                url="https://polymarket.com/event/example",
+                outcome="Yes",
+                market_slug="example-market",
+                token_id="123",
+                condition_id="0xabc",
+                label='Question "A" — Yes',
+                quote_size=Decimal("2.5"),
+            )
+        ],
+    )
+    config = replace(
+        config,
+        risk=replace(config.risk, max_order_size=Decimal("2.5")),
+    )
+
+    write_config(path, config)
+    loaded = load_config(path)
+
+    assert loaded.run_duration_seconds == 5_400
+    assert loaded.markets == config.markets
+    assert loaded.risk.max_order_size == Decimal("2.5")
+    assert "PRIVATE_KEY" not in path.read_text(encoding="utf-8")

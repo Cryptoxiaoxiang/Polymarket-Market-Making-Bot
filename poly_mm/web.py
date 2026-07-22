@@ -8,13 +8,14 @@ import re
 import signal
 from collections import deque
 from dataclasses import replace
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 from poly_mm.client import PolymarketClient
-from poly_mm.config import BotConfig, Settings, load_config, update_dotenv_values
+from poly_mm.config import BotConfig, MarketConfig, Settings, load_config, update_dotenv_values, write_config
 from poly_mm.console import ConsoleServer
-from poly_mm.discovery import resolve_market
+from poly_mm.discovery import market_options, resolve_market
 from poly_mm.engine import MarketMakerEngine
 from poly_mm.models import PreflightReport
 
@@ -133,10 +134,23 @@ class DashboardController:
         status["configuration"] = {
             "market_count": len(config.enabled_markets),
             "cancel_after_seconds": config.cancel_after_seconds,
+            "run_duration_seconds": config.run_duration_seconds,
             "max_order_size": str(config.risk.max_order_size),
             "max_position_per_token": str(config.risk.max_position_per_token),
             "max_total_open_notional": str(config.risk.max_total_open_notional),
             "halt_on_fill": config.halt_on_fill,
+            "markets": [
+                {
+                    "url": market.url,
+                    "outcome": market.outcome,
+                    "market_slug": market.market_slug,
+                    "token_id": market.token_id,
+                    "condition_id": market.condition_id,
+                    "label": market.label,
+                    "quote_size": str(market.quote_size or config.strategy.quote_size),
+                }
+                for market in config.enabled_markets
+            ],
         }
         if self.last_error:
             status["last_error"] = self.last_error
@@ -277,6 +291,83 @@ class DashboardController:
             "status": await self.snapshot(),
         }
 
+    async def resolve_market_url(self, payload: dict[str, Any]) -> dict[str, Any]:
+        url = _payload_text(payload, "url", 500)
+        if not url:
+            raise ValueError("请先粘贴 Polymarket 市场网址。")
+        options = await asyncio.to_thread(market_options, url)
+        return {"message": f"识别到 {len(options)} 个可挂单市场。", "markets": options}
+
+    async def save_setup(self, payload: dict[str, Any]) -> dict[str, Any]:
+        async with self.lock:
+            if self.running:
+                raise ValueError("请先停止挂单任务，再修改挂单设置。")
+            current = load_config(self.config_path, require_markets=False)
+            rows = payload.get("markets", [])
+            if not isinstance(rows, list) or len(rows) > 20:
+                raise ValueError("挂单市场列表无效或超过 20 个。")
+
+            markets: list[MarketConfig] = []
+            quote_sizes: list[Decimal] = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    raise ValueError("挂单市场配置无效。")
+                url = _payload_text(row, "url", 500)
+                if not url:
+                    continue
+                outcome = _payload_text(row, "outcome", 100)
+                market_slug = _payload_text(row, "market_slug", 250)
+                quote_size = _positive_decimal(row.get("quote_size"), "单次挂单数量")
+                resolved = await asyncio.to_thread(
+                    resolve_market,
+                    MarketConfig(
+                        url=url,
+                        outcome=outcome,
+                        market_slug=market_slug,
+                        quote_size=quote_size,
+                    ),
+                )
+                markets.append(resolved)
+                quote_sizes.append(quote_size)
+
+            cancel_after_seconds = float(
+                _positive_decimal(payload.get("cancel_after_seconds"), "撤单等待秒数")
+            )
+            max_position = _positive_decimal(
+                payload.get("max_position_per_token"), "单 outcome 最大仓位"
+            )
+            max_notional = _positive_decimal(
+                payload.get("max_total_open_notional"), "总开放名义金额"
+            )
+            duration_enabled = payload.get("run_duration_enabled") is True
+            hours = _bounded_int(payload.get("run_duration_hours", 0), "有效期小时", 0, 168)
+            minutes = _bounded_int(payload.get("run_duration_minutes", 0), "有效期分钟", 0, 59)
+            run_duration_seconds = hours * 3600 + minutes * 60 if duration_enabled else 0
+            if duration_enabled and run_duration_seconds <= 0:
+                raise ValueError("启用有效期时，小时和分钟不能同时为 0。")
+            if run_duration_seconds > 7 * 24 * 60 * 60:
+                raise ValueError("挂单有效期不能超过 7 天。")
+            maximum_quote_size = max(quote_sizes, default=current.strategy.quote_size)
+            updated = replace(
+                current,
+                dry_run=payload.get("dry_run") is True,
+                cancel_after_seconds=cancel_after_seconds,
+                run_duration_seconds=run_duration_seconds,
+                markets=markets,
+                strategy=replace(current.strategy, quote_size=maximum_quote_size),
+                risk=replace(
+                    current.risk,
+                    max_order_size=maximum_quote_size,
+                    max_position_per_token=max_position,
+                    max_total_open_notional=max_notional,
+                ),
+            )
+            write_config(self.config_path, updated)
+            self.last_error = ""
+            self.last_preflight = None
+        message = "挂单设置已保存。" if markets else "挂单设置已清空；当前没有挂单任务。"
+        return {"message": message, "status": await self.snapshot()}
+
     async def _resolved_config(self) -> BotConfig:
         config = load_config(self.config_path, require_markets=False)
         resolved_markets = []
@@ -326,6 +417,26 @@ def _payload_text(payload: dict[str, Any], key: str, maximum: int) -> str:
     if len(value) > maximum:
         raise ValueError(f"{key} 过长。")
     return value
+
+
+def _positive_decimal(value: object, label: str) -> Decimal:
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, ValueError) as error:
+        raise ValueError(f"{label}必须是有效数字。") from error
+    if not result.is_finite() or result <= 0:
+        raise ValueError(f"{label}必须大于 0。")
+    return result
+
+
+def _bounded_int(value: object, label: str, minimum: int, maximum: int) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{label}无效。") from error
+    if not minimum <= result <= maximum:
+        raise ValueError(f"{label}必须在 {minimum} 到 {maximum} 之间。")
+    return result
 
 
 def _preflight_dict(report: PreflightReport) -> dict[str, str]:

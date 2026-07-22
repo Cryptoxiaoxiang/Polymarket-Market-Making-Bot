@@ -73,6 +73,7 @@ class BotConfig:
     dry_run: bool = False
     poll_interval_seconds: float = 2
     cancel_after_seconds: float = 10
+    run_duration_seconds: int = 0
     cancel_all_on_start: bool = True
     cancel_all_on_shutdown: bool = True
     halt_on_fill: bool = True
@@ -113,6 +114,7 @@ def load_config(path: str | Path, *, require_markets: bool = True) -> BotConfig:
         dry_run=bool(data.get("dry_run", False)),
         poll_interval_seconds=float(data.get("poll_interval_seconds", 2)),
         cancel_after_seconds=float(data.get("cancel_after_seconds", 10)),
+        run_duration_seconds=max(0, int(data.get("run_duration_seconds", 0))),
         cancel_all_on_start=bool(data.get("cancel_all_on_start", True)),
         cancel_all_on_shutdown=bool(data.get("cancel_all_on_shutdown", True)),
         halt_on_fill=bool(data.get("halt_on_fill", True)),
@@ -139,6 +141,8 @@ def load_config(path: str | Path, *, require_markets: bool = True) -> BotConfig:
         raise ValueError("Polling intervals must be positive")
     if config.cancel_after_seconds <= 0:
         raise ValueError("cancel_after_seconds must be positive")
+    if config.run_duration_seconds > 7 * 24 * 60 * 60:
+        raise ValueError("run_duration_seconds cannot exceed 7 days")
     if config.cancel_retry_count < 1:
         raise ValueError("cancel_retry_count must be at least 1")
     if config.cancel_retry_base_seconds < 0:
@@ -172,6 +176,76 @@ def load_config(path: str | Path, *, require_markets: bool = True) -> BotConfig:
     ):
         raise ValueError("market quote_size must be positive")
     return config
+
+
+def write_config(path: str | Path, config: BotConfig) -> None:
+    """Atomically persist the operator-editable configuration without secrets."""
+    config_path = Path(path)
+    temporary_path = config_path.with_name(f".{config_path.name}.tmp")
+    temporary_path.write_text(_config_text(config), encoding="utf-8")
+    temporary_path.replace(config_path)
+
+
+def _config_text(config: BotConfig) -> str:
+    lines = [
+        f"dry_run = {_toml_bool(config.dry_run)}",
+        f"poll_interval_seconds = {config.poll_interval_seconds}",
+        f"cancel_after_seconds = {config.cancel_after_seconds}",
+        f"run_duration_seconds = {config.run_duration_seconds}",
+        f"cancel_all_on_start = {_toml_bool(config.cancel_all_on_start)}",
+        f"cancel_all_on_shutdown = {_toml_bool(config.cancel_all_on_shutdown)}",
+        f"halt_on_fill = {_toml_bool(config.halt_on_fill)}",
+        f"preflight_enabled = {_toml_bool(config.preflight_enabled)}",
+        f"websocket_enabled = {_toml_bool(config.websocket_enabled)}",
+        f"position_poll_interval_seconds = {config.position_poll_interval_seconds}",
+        f"cancel_retry_count = {config.cancel_retry_count}",
+        f"cancel_retry_base_seconds = {config.cancel_retry_base_seconds}",
+        f"console_enabled = {_toml_bool(config.console_enabled)}",
+        f'console_host = "{_toml_escape(config.console_host)}"',
+        f"console_port = {config.console_port}",
+        "",
+    ]
+    for market in config.markets:
+        lines.extend(
+            [
+                "[[markets]]",
+                f'url = "{_toml_escape(market.url)}"',
+                f'outcome = "{_toml_escape(market.outcome)}"',
+                f'market_slug = "{_toml_escape(market.market_slug)}"',
+                f'token_id = "{_toml_escape(market.token_id)}"',
+                f'condition_id = "{_toml_escape(market.condition_id)}"',
+                f'label = "{_toml_escape(market.label)}"',
+                f"enabled = {_toml_bool(market.enabled)}",
+                f'quote_size = "{market.quote_size or config.strategy.quote_size}"',
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "[strategy]",
+            f'quote_size = "{config.strategy.quote_size}"',
+            f"join_best_price = {_toml_bool(config.strategy.join_best_price)}",
+            f"min_edge_ticks = {config.strategy.min_edge_ticks}",
+            f'min_spread = "{config.strategy.min_spread}"',
+            f'max_spread = "{config.strategy.max_spread}"',
+            "",
+            "[risk]",
+            f'max_order_size = "{config.risk.max_order_size}"',
+            f'max_position_per_token = "{config.risk.max_position_per_token}"',
+            f'max_total_open_notional = "{config.risk.max_total_open_notional}"',
+            f"max_open_orders_per_token = {config.risk.max_open_orders_per_token}",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _toml_bool(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def _toml_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").replace("\r", " ")
 
 
 def _decimal_fields(raw: dict, names: set[str]) -> dict:

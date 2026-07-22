@@ -63,6 +63,13 @@ class MarketMakerEngine:
         shutdown_failures: list[str] = []
         try:
             self._restore_orders()
+            self.quote_deadline_at = (
+                time() + self.config.run_duration_seconds
+                if self.config.run_duration_seconds > 0
+                else None
+            )
+            self.quote_task_expired = False
+            self._persist_orders()
             if not self.config.dry_run and self.config.preflight_enabled:
                 report = await asyncio.to_thread(self.client.run_preflight, self.config)
                 self.preflight_report = report

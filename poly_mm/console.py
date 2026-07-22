@@ -119,6 +119,12 @@ class _ConsoleHandler(BaseHTTPRequestHandler):
         if path == "/api/account":
             self._controller_payload_action("save_account", timeout=45)
             return
+        if path == "/api/setup":
+            self._controller_payload_action("save_setup", timeout=90)
+            return
+        if path == "/api/resolve-market":
+            self._controller_payload_action("resolve_market_url", timeout=45)
+            return
         if path == "/api/start":
             self._controller_action("start_bot", timeout=45)
             return

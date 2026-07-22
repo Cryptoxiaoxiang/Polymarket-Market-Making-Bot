@@ -25,7 +25,7 @@
           </button>
           <button data-view="tasks">
             <svg viewBox="0 0 24 24"><path d="M4 7h16M7 4v6m10 4v6M4 17h16" /></svg>
-            挂单任务<span id="market-count" class="nav-count">0</span>
+            挂单设置<span id="market-count" class="nav-count">0</span>
           </button>
           <button data-view="logs-view">
             <svg viewBox="0 0 24 24"><path d="M5 4h14v16H5zM8 8h8M8 12h8M8 16h5" /></svg>
@@ -109,16 +109,24 @@
         </section>
 
         <section id="tasks" class="view">
-          <header class="topbar"><div><p class="eyebrow">QUOTE TASK</p><h1>挂单任务</h1><p class="subtitle">管理任务状态、有效期和风控摘要</p></div><div class="actions"><button id="pause-button" class="btn secondary">暂停并撤单</button><button id="resume-button" class="btn primary">恢复报价</button></div></header>
-          <section class="card page-card form-card">
-            <div class="section-title"><div><h2>挂单有效期</h2><p>默认不限时；到期后自动停止新挂单并撤销机器人订单</p></div><span id="expiry-state" class="summary">不限时</span></div>
-            <div class="expiry-row"><label class="switch-row compact"><span><strong>启用有效期</strong><small>关闭时任务没有截止时间</small></span><span class="switch-control"><input id="expiry-enabled" type="checkbox" /><i></i></span></label><label class="field duration-field"><span>小时</span><select id="expiry-hours" aria-label="小时" disabled></select></label><label class="field duration-field"><span>分钟</span><select id="expiry-minutes" aria-label="分钟" disabled></select></label></div>
-            <div class="form-actions"><button id="apply-expiry" class="btn primary" type="button">应用有效期设置</button></div>
-          </section>
-          <section class="card page-card form-card">
-            <div class="section-title"><div><h2>风险与刷新</h2><p>当前 config.toml 中生效的只读配置</p></div><span id="task-mode" class="summary">正在读取</span></div>
-            <div class="config-grid"><div><span>单笔最大数量</span><strong id="max-order-size">—</strong></div><div><span>单 token 最大仓位</span><strong id="max-position">—</strong></div><div><span>总开放名义金额</span><strong id="max-notional">—</strong></div><div><span>撤单刷新秒数</span><strong id="cancel-seconds">—</strong></div></div>
-          </section>
+          <header class="topbar"><div><p class="eyebrow">QUOTE SETTINGS</p><h1>挂单设置</h1><p class="subtitle">添加市场并保存后，才会创建一项可启动的挂单任务</p></div><div class="actions"><button id="pause-button" class="btn secondary">暂停并撤单</button><button id="resume-button" class="btn secondary">恢复报价</button><button id="add-market-button" class="btn primary" type="button">＋ 添加市场</button></div></header>
+          <form id="setup-form">
+            <section class="card form-card"><div class="section-title"><div><h2>做市市场</h2><p>没有保存市场时，任务数为 0，机器人不能启动</p></div><span id="configured-market-summary" class="summary">尚未配置市场</span></div><div id="setup-markets-list" class="market-list"></div></section>
+            <section class="card form-card"><div class="section-title"><div><h2>仓位与刷新</h2><p>以下设置只会在保存市场并启动任务后生效</p></div></div>
+              <div class="form-grid three-columns">
+                <label class="field"><span>单 outcome 最大仓位</span><input name="max_position_per_token" inputmode="decimal" required /></label>
+                <label class="field"><span>总开放名义金额</span><input name="max_total_open_notional" inputmode="decimal" required /></label>
+                <label class="field"><span>撤单等待秒数</span><input name="cancel_after_seconds" inputmode="decimal" required /><small>到达该时间后撤单并按最新盘口重新报价</small></label>
+              </div>
+              <div class="switch-row duration-setting-row">
+                <span class="duration-setting-copy"><strong>设置挂单有效期</strong><small>默认关闭；每次启动时重新倒计时，到期后撤单并停止报价</small></span>
+                <label class="switch-control" title="是否启用挂单有效期"><input id="run-duration-enabled" type="checkbox" name="run_duration_enabled" /><i></i></label>
+                <div id="run-duration-fields" class="duration-picker" aria-label="挂单有效期"><select name="run_duration_hours" aria-label="有效期小时" disabled></select><select name="run_duration_minutes" aria-label="有效期分钟" disabled></select></div>
+              </div>
+              <label class="switch-row"><span><strong>模拟运行</strong><small>默认关闭；开启后只计算报价和写日志，不提交真实订单</small></span><span class="switch-control"><input type="checkbox" name="dry_run" /><i></i></span></label>
+              <div class="form-actions"><button id="clear-setup" class="btn secondary" type="button">清空挂单设置</button><button class="btn primary" type="submit">保存挂单设置</button></div>
+            </section>
+          </form>
         </section>
 
         <section id="logs-view" class="view">
@@ -127,6 +135,17 @@
         </section>
       </div></main>
     </div>
+    <template id="market-template">
+      <article class="market-row">
+        <div class="market-row-heading"><strong class="market-title">市场</strong><button class="text-button remove-market" type="button">移除</button></div>
+        <div class="market-fields">
+          <label class="field market-url-field"><span>Polymarket 市场网址</span><div class="market-url-input"><input data-field="url" required placeholder="粘贴 https://polymarket.com/event/…" /><button class="btn secondary resolve-market" type="button">识别网址</button></div><div class="selected-market" data-field="selected_market" hidden></div><div class="market-lookup-result" data-field="market_lookup" hidden></div></label>
+          <label class="field"><span>挂单 outcome</span><select data-field="outcome" disabled><option value="">请先识别网址</option></select></label>
+          <label class="field"><span>单次挂单数量</span><input data-field="quote_size" inputmode="decimal" required /></label>
+          <input data-field="market_slug" type="hidden" /><input data-field="token_id" type="hidden" /><input data-field="condition_id" type="hidden" /><input data-field="label" type="hidden" />
+        </div>
+      </article>
+    </template>
     <script src="/static/app.js"></script>
   </body>
 </html>

@@ -119,6 +119,7 @@ th:first-child, td:first-child { padding-left: 0; }
 .form-card:first-of-type { margin-top: 0; }
 .section-title { margin-bottom: 18px; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.form-grid.three-columns { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .full-field { grid-column: 1 / -1; }
 .field { display: grid; gap: 7px; color: #cbd5e6; font-size: 12px; font-weight: 700; }
 .field small, .details-note { color: #78859b; font-size: 10px; font-weight: 500; }
@@ -132,6 +133,26 @@ th:first-child, td:first-child { padding-left: 0; }
 .account-grid strong { overflow-wrap: anywhere; font-size: 12px; }
 .config-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .config-grid strong { color: var(--mint); font-size: 18px; }
+.market-list { display: grid; gap: 12px; }
+.market-row { padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-2); }
+.market-row-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 13px; }
+.market-fields { display: grid; grid-template-columns: minmax(320px, 1.8fr) minmax(150px, .7fr) minmax(140px, .65fr); gap: 12px; align-items: start; }
+.market-url-input { display: flex; gap: 8px; }
+.market-url-input input { min-width: 0; }
+.market-url-input button { flex: 0 0 auto; white-space: nowrap; }
+.selected-market { margin-top: 8px; color: var(--mint); font-size: 12px; font-weight: 700; line-height: 1.45; }
+.market-lookup-result { margin-top: 8px; padding: 10px; border: 1px solid #425070; border-radius: 9px; background: #101827; }
+.market-lookup-result p { margin: 0 0 8px; color: var(--muted); font-size: 12px; }
+.market-match-group { margin-top: 12px; padding-top: 10px; border-top: 1px solid #27334d; }
+.market-match-group:first-of-type { margin-top: 0; padding-top: 0; border-top: 0; }
+.market-match-group > p { color: var(--text); font-weight: 600; }
+.market-match { display: block; width: 100%; margin-top: 6px; border: 0; border-radius: 8px; padding: 9px 11px; background: #25304a; color: var(--text); text-align: left; }
+.empty-setup { margin: 0; padding: 28px; border: 1px dashed #34415a; border-radius: 11px; color: var(--muted); text-align: center; }
+.duration-setting-row { flex-wrap: wrap; border-top: 1px solid var(--line-soft); }
+.duration-setting-copy { min-width: 280px; }
+.duration-picker { display: flex; flex: 0 0 auto; gap: 8px; }
+.duration-picker select { width: 112px; height: 38px; padding: 0 9px; border: 1px solid var(--line); border-radius: 9px; outline: none; background: #0b111c; color: var(--text); }
+.duration-picker select:focus { border-color: #3c9b77; box-shadow: 0 0 0 3px rgba(124, 244, 191, .07); }
 .expiry-row { display: grid; grid-template-columns: minmax(280px, 1fr) 140px 140px; gap: 16px; align-items: end; }
 .switch-row { display: flex; align-items: center; gap: 14px; padding: 16px 0; color: var(--text); }
 .switch-row.compact { padding: 0 8px 0 0; }
@@ -149,6 +170,7 @@ th:first-child, td:first-child { padding-left: 0; }
   .dashboard-grid { grid-template-columns: 1fr; }
   .content { padding-inline: 26px; }
   .config-grid { grid-template-columns: repeat(2, 1fr); }
+  .form-grid.three-columns, .market-fields { grid-template-columns: 1fr 1fr; }
 }
 
 @media (max-width: 760px) {
@@ -162,7 +184,11 @@ th:first-child, td:first-child { padding-left: 0; }
   .nav-count { margin-left: 0; font-size: 10px; }
   .content { padding: 22px 14px 40px; }
   .topbar { align-items: flex-start; flex-direction: column; }
-  .metrics, .form-grid, .account-grid, .config-grid, .expiry-row { grid-template-columns: 1fr; }
+  .metrics, .form-grid, .form-grid.three-columns, .account-grid, .config-grid, .expiry-row, .market-fields { grid-template-columns: 1fr; }
+  .duration-setting-copy { width: 100%; min-width: 0; }
+  .duration-setting-row .switch-control { margin-left: auto; }
+  .duration-picker { width: 100%; }
+  .duration-picker select { width: auto; flex: 1; }
   .full-field { grid-column: auto; }
   .card-head, .section-title { align-items: flex-start; flex-direction: column; }
   .table-wrap { padding-inline: 14px; }

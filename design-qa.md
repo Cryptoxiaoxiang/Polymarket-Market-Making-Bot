@@ -21,7 +21,7 @@
 
 **Open Questions**
 
-- None. The Polymarket-specific “挂单任务” content is an intentional product difference, not visual drift. The Predictfun-style “运行日志” page has since been added to the same navigation and card system.
+- None. The earlier read-only “风险与刷新” task card has been replaced by a Predictfun-style, editable Polymarket market setup flow. The “运行日志” page uses the same navigation and card system.
 
 **Implementation Checklist**
 

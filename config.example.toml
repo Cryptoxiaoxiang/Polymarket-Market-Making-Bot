@@ -2,6 +2,7 @@
 dry_run = false
 poll_interval_seconds = 2.0
 cancel_after_seconds = 10.0
+run_duration_seconds = 0
 cancel_all_on_start = true
 cancel_all_on_shutdown = true
 # If a quote trades even partially, stop making that token. This prevents a loop

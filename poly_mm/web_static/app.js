@@ -3,7 +3,13 @@ const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (character
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
 }[character]));
 
-let expiryFormDirty = false;
+const setupForm = byId('setup-form');
+const setupMarketsList = byId('setup-markets-list');
+const marketTemplate = byId('market-template');
+const runDurationEnabled = setupForm.elements.namedItem('run_duration_enabled');
+const runDurationHours = setupForm.elements.namedItem('run_duration_hours');
+const runDurationMinutes = setupForm.elements.namedItem('run_duration_minutes');
+let setupFormDirty = false;
 let accountFormDirty = false;
 const logPanels = [...document.querySelectorAll('.log-preview, .full-log')];
 const logRefreshStatus = byId('log-refresh-status');
@@ -29,18 +35,143 @@ function showNotice(message, isError = false) {
   showNotice.timeout = window.setTimeout(() => { notice.hidden = true; }, 5000);
 }
 
-function formatDuration(total) {
-  const seconds = Math.max(0, Number(total) || 0);
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  const remainder = Math.floor(seconds % 60);
-  return `${hours}小时 ${minutes}分 ${remainder}秒`;
+function syncDurationControls() {
+  const enabled = runDurationEnabled.checked;
+  runDurationHours.disabled = !enabled;
+  runDurationMinutes.disabled = !enabled;
 }
 
-function syncExpiryControls() {
-  const enabled = byId('expiry-enabled').checked;
-  byId('expiry-hours').disabled = !enabled;
-  byId('expiry-minutes').disabled = !enabled;
+function selectedMarketText(row) {
+  const selected = row.querySelector('[data-field="selected_market"]');
+  const label = row.querySelector('[data-field="label"]').value;
+  const outcome = row.querySelector('[data-field="outcome"]').value;
+  selected.textContent = label && outcome ? `已选择：${label}` : '';
+  selected.hidden = !selected.textContent;
+}
+
+function applyMarketChoice(row, market, selectedOutcome) {
+  const outcomeSelect = row.querySelector('[data-field="outcome"]');
+  outcomeSelect.innerHTML = market.outcomes.map((outcome) => `<option value="${escapeHtml(outcome.name)}">${escapeHtml(outcome.name)}</option>`).join('');
+  outcomeSelect.disabled = false;
+  outcomeSelect.value = selectedOutcome.name;
+  row.querySelector('[data-field="market_slug"]').value = market.market_slug;
+  row.querySelector('[data-field="condition_id"]').value = market.condition_id;
+  row.querySelector('[data-field="token_id"]').value = selectedOutcome.token_id;
+  row.querySelector('[data-field="label"]').value = `${market.question} — ${selectedOutcome.name}`;
+  selectedMarketText(row);
+}
+
+function addSetupMarket(market = {}) {
+  const empty = setupMarketsList.querySelector('.empty-setup');
+  if (empty) empty.remove();
+  const row = marketTemplate.content.firstElementChild.cloneNode(true);
+  row.querySelector('[data-field="url"]').value = market.url || '';
+  row.querySelector('[data-field="quote_size"]').value = market.quote_size || '';
+  ['market_slug', 'token_id', 'condition_id', 'label'].forEach((field) => {
+    row.querySelector(`[data-field="${field}"]`).value = market[field] || '';
+  });
+  const outcome = row.querySelector('[data-field="outcome"]');
+  if (market.outcome) {
+    outcome.innerHTML = `<option value="${escapeHtml(market.outcome)}">${escapeHtml(market.outcome)}</option>`;
+    outcome.disabled = false;
+  }
+  selectedMarketText(row);
+  row.querySelector('.remove-market').addEventListener('click', () => {
+    row.remove();
+    setupFormDirty = true;
+    updateConfiguredMarketSummary();
+  });
+  row.querySelector('.resolve-market').addEventListener('click', () => resolveMarketRow(row));
+  row.querySelector('[data-field="url"]').addEventListener('input', () => {
+    ['market_slug', 'token_id', 'condition_id', 'label'].forEach((field) => {
+      row.querySelector(`[data-field="${field}"]`).value = '';
+    });
+    outcome.innerHTML = '<option value="">请重新识别网址</option>';
+    outcome.disabled = true;
+    selectedMarketText(row);
+  });
+  setupMarketsList.append(row);
+  updateConfiguredMarketSummary();
+}
+
+function renderSetupMarkets(markets = [], saved = false) {
+  setupMarketsList.replaceChildren();
+  if (!markets.length) {
+    setupMarketsList.innerHTML = '<p class="empty-setup">尚未添加市场。点击右上角“添加市场”后，粘贴 Polymarket 网址并识别。</p>';
+  } else {
+    markets.forEach(addSetupMarket);
+  }
+  if (saved && markets.length) byId('configured-market-summary').textContent = `已保存 ${markets.length} 个市场`;
+  else updateConfiguredMarketSummary();
+}
+
+function updateConfiguredMarketSummary() {
+  const count = setupMarketsList.querySelectorAll('.market-row').length;
+  byId('configured-market-summary').textContent = count ? `${count} 个市场待保存` : '尚未配置市场';
+}
+
+function renderMarketChoices(row, result) {
+  const container = row.querySelector('[data-field="market_lookup"]');
+  container.replaceChildren();
+  container.hidden = false;
+  const message = document.createElement('p');
+  message.textContent = result.message;
+  container.append(message);
+  result.markets.forEach((market) => {
+    const group = document.createElement('div');
+    group.className = 'market-match-group';
+    const title = document.createElement('p');
+    title.textContent = market.question;
+    group.append(title);
+    market.outcomes.forEach((outcome) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'market-match';
+      button.textContent = `选择「${outcome.name}」挂单`;
+      button.addEventListener('click', () => {
+        applyMarketChoice(row, market, outcome);
+        container.hidden = true;
+        setupFormDirty = true;
+      });
+      group.append(button);
+    });
+    container.append(group);
+  });
+}
+
+async function resolveMarketRow(row) {
+  const url = row.querySelector('[data-field="url"]').value.trim();
+  if (!/^https:\/\/(www\.)?polymarket\.com\/(event|market)\//i.test(url)) {
+    showNotice('请粘贴完整的 Polymarket 市场网址。', true);
+    return;
+  }
+  const button = row.querySelector('.resolve-market');
+  button.disabled = true;
+  button.textContent = '识别中…';
+  try {
+    const response = await fetch('/api/resolve-market', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Requested-With': 'poly-mm-console'},
+      body: JSON.stringify({url}),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    renderMarketChoices(row, result);
+  } catch (error) {
+    showNotice(`市场识别失败：${error.message}`, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = '识别网址';
+  }
+}
+
+function collectSetupMarkets() {
+  return [...setupMarketsList.querySelectorAll('.market-row')].map((row) => ({
+    url: row.querySelector('[data-field="url"]').value.trim(),
+    outcome: row.querySelector('[data-field="outcome"]').value,
+    market_slug: row.querySelector('[data-field="market_slug"]').value,
+    quote_size: row.querySelector('[data-field="quote_size"]').value.trim(),
+  }));
 }
 
 function marketCell(label, detail = '') {
@@ -116,28 +247,21 @@ function render(status) {
   byId('stop-button').disabled = !running;
   byId('pause-button').disabled = !running;
   byId('resume-button').disabled = !running;
-  byId('apply-expiry').disabled = !running;
   byId('save-account').disabled = running;
   byId('run-preflight').disabled = running || !account.private_key_set;
 
-  const quoteTask = status.quote_task || {};
-  if (quoteTask.expired) byId('expiry-state').textContent = '已到期 · 挂单已停止';
-  else if (quoteTask.deadline_at) byId('expiry-state').textContent = `剩余 ${formatDuration(quoteTask.remaining_seconds)} · ${new Date(quoteTask.deadline_at * 1000).toLocaleString()}`;
-  else byId('expiry-state').textContent = '不限时';
-  if (!expiryFormDirty) {
-    byId('expiry-enabled').checked = Boolean(quoteTask.deadline_at);
-    if (quoteTask.deadline_at && !quoteTask.expired) {
-      const totalMinutes = Math.max(1, Math.ceil(Number(quoteTask.remaining_seconds || 0) / 60));
-      byId('expiry-hours').value = String(Math.floor(totalMinutes / 60));
-      byId('expiry-minutes').value = String(totalMinutes % 60);
-    }
-    syncExpiryControls();
+  if (!setupFormDirty) {
+    setupForm.elements.namedItem('max_position_per_token').value = configuration.max_position_per_token ?? '';
+    setupForm.elements.namedItem('max_total_open_notional').value = configuration.max_total_open_notional ?? '';
+    setupForm.elements.namedItem('cancel_after_seconds').value = configuration.cancel_after_seconds ?? '';
+    setupForm.elements.namedItem('dry_run').checked = Boolean(status.dry_run);
+    const durationMinutes = Math.floor(Number(configuration.run_duration_seconds || 0) / 60);
+    runDurationEnabled.checked = durationMinutes > 0;
+    runDurationHours.value = String(Math.floor(durationMinutes / 60));
+    runDurationMinutes.value = String(durationMinutes % 60);
+    syncDurationControls();
+    renderSetupMarkets(configuration.markets || [], true);
   }
-  byId('task-mode').textContent = status.dry_run ? '模拟模式' : '实盘模式';
-  byId('max-order-size').textContent = configuration.max_order_size ?? '—';
-  byId('max-position').textContent = configuration.max_position_per_token ?? '—';
-  byId('max-notional').textContent = configuration.max_total_open_notional ?? '—';
-  byId('cancel-seconds').textContent = configuration.cancel_after_seconds ?? '—';
 
   if (status.last_error) showNotice(status.last_error, true);
 }
@@ -275,22 +399,53 @@ byId('account-form').addEventListener('submit', async (event) => {
   if (saved) accountFormDirty = false;
 });
 
-byId('expiry-hours').innerHTML = Array.from({ length: 169 }, (_, index) => `<option value="${index}">${index}</option>`).join('');
-byId('expiry-hours').value = '1';
-byId('expiry-minutes').innerHTML = Array.from({ length: 60 }, (_, index) => `<option value="${index}">${index}</option>`).join('');
-byId('expiry-enabled').addEventListener('change', () => { expiryFormDirty = true; syncExpiryControls(); });
-byId('expiry-hours').addEventListener('change', () => { expiryFormDirty = true; });
-byId('expiry-minutes').addEventListener('change', () => { expiryFormDirty = true; });
-byId('apply-expiry').addEventListener('click', async () => {
-  expiryFormDirty = false;
-  if (byId('expiry-enabled').checked) {
-    await action('/api/expiry', { body: { hours: Number(byId('expiry-hours').value), minutes: Number(byId('expiry-minutes').value) } });
-  } else {
-    await action('/api/expiry/clear');
+runDurationHours.innerHTML = Array.from({ length: 169 }, (_, index) => `<option value="${index}">${index} 小时</option>`).join('');
+runDurationMinutes.innerHTML = Array.from({ length: 60 }, (_, index) => `<option value="${index}">${index} 分钟</option>`).join('');
+byId('add-market-button').addEventListener('click', () => {
+  addSetupMarket();
+  setupFormDirty = true;
+});
+setupForm.addEventListener('input', () => { setupFormDirty = true; });
+setupForm.addEventListener('change', () => { setupFormDirty = true; });
+runDurationEnabled.addEventListener('change', () => {
+  if (runDurationEnabled.checked && runDurationHours.value === '0' && runDurationMinutes.value === '0') runDurationHours.value = '1';
+  syncDurationControls();
+});
+setupForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const markets = collectSetupMarkets();
+  if (markets.some((market) => !market.url || !market.outcome || !market.market_slug)) {
+    showNotice('请先识别每个市场网址并选择要挂单的 outcome。', true);
+    return;
   }
+  const saved = await action('/api/setup', { body: {
+    markets,
+    max_position_per_token: setupForm.elements.namedItem('max_position_per_token').value,
+    max_total_open_notional: setupForm.elements.namedItem('max_total_open_notional').value,
+    cancel_after_seconds: setupForm.elements.namedItem('cancel_after_seconds').value,
+    run_duration_enabled: runDurationEnabled.checked,
+    run_duration_hours: Number(runDurationHours.value),
+    run_duration_minutes: Number(runDurationMinutes.value),
+    dry_run: setupForm.elements.namedItem('dry_run').checked,
+  } });
+  if (saved) setupFormDirty = false;
+});
+byId('clear-setup').addEventListener('click', async () => {
+  if (!window.confirm('确认清空全部挂单市场？机器人将保持停止，且不会创建订单。')) return;
+  const saved = await action('/api/setup', { body: {
+    markets: [],
+    max_position_per_token: setupForm.elements.namedItem('max_position_per_token').value,
+    max_total_open_notional: setupForm.elements.namedItem('max_total_open_notional').value,
+    cancel_after_seconds: setupForm.elements.namedItem('cancel_after_seconds').value,
+    run_duration_enabled: false,
+    run_duration_hours: 0,
+    run_duration_minutes: 0,
+    dry_run: setupForm.elements.namedItem('dry_run').checked,
+  } });
+  if (saved) setupFormDirty = false;
 });
 
-syncExpiryControls();
+syncDurationControls();
 refresh();
 refreshLogs();
 window.setInterval(() => { refresh(); refreshLogs(); }, 2000);

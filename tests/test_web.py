@@ -1,7 +1,10 @@
 import asyncio
 import logging
 import os
+from dataclasses import replace
+from decimal import Decimal
 
+from poly_mm.config import MarketConfig, load_config
 from poly_mm.web import ACCOUNT_ENV_KEYS, DashboardController, MemoryLogHandler
 
 
@@ -128,3 +131,58 @@ def test_eoa_account_rejects_a_different_funder_address(tmp_path, monkeypatch) -
             raise AssertionError("expected a mismatched EOA funder to be rejected")
 
     asyncio.run(scenario())
+
+
+def test_web_setup_is_explicitly_saved_and_can_be_cleared(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "dry_run = false\n[risk]\nmax_position_per_token = \"25\"\n"
+        "max_total_open_notional = \"100\"\n",
+        encoding="utf-8",
+    )
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+
+    def fake_resolve(market: MarketConfig) -> MarketConfig:
+        return replace(
+            market,
+            token_id="123",
+            condition_id="0xabc",
+            market_slug="resolved-market",
+            label=f"Resolved question — {market.outcome}",
+        )
+
+    monkeypatch.setattr("poly_mm.web.resolve_market", fake_resolve)
+    controller = DashboardController(config_path, env_path)
+    payload = {
+        "markets": [
+            {
+                "url": "https://polymarket.com/event/example",
+                "outcome": "Yes",
+                "market_slug": "resolved-market",
+                "quote_size": "2.5",
+            }
+        ],
+        "max_position_per_token": "12",
+        "max_total_open_notional": "40",
+        "cancel_after_seconds": "8",
+        "run_duration_enabled": True,
+        "run_duration_hours": 1,
+        "run_duration_minutes": 30,
+        "dry_run": False,
+    }
+
+    saved = asyncio.run(controller.save_setup(payload))
+    config = load_config(config_path)
+    assert saved["status"]["configuration"]["market_count"] == 1
+    assert config.markets[0].token_id == "123"
+    assert config.markets[0].quote_size == Decimal("2.5")
+    assert config.risk.max_order_size == Decimal("2.5")
+    assert config.run_duration_seconds == 5_400
+    assert config.dry_run is False
+
+    payload["markets"] = []
+    payload["run_duration_enabled"] = False
+    cleared = asyncio.run(controller.save_setup(payload))
+    assert cleared["status"]["configuration"]["market_count"] == 0
+    assert load_config(config_path, require_markets=False).markets == []

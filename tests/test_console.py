@@ -64,8 +64,10 @@ def test_console_status_and_pause_action_without_login(tmp_path) -> None:
             page_request = Request(f"{origin}/")
             status, page = await asyncio.to_thread(_read, page_request)
             assert status == 200
-            assert 'id="expiry-enabled" type="checkbox"' in page
-            assert 'id="expiry-hours" aria-label="小时" disabled' in page
+            assert 'id="setup-form"' in page
+            assert 'id="run-duration-enabled" type="checkbox"' in page
+            assert 'name="run_duration_hours" aria-label="有效期小时" disabled' in page
+            assert "当前 config.toml 中生效的只读配置" not in page
             assert 'id="account-form"' in page
             assert 'name="private_key" type="password"' in page
             assert 'id="start-button" class="btn primary"' in page
