@@ -67,13 +67,7 @@ class MarketMakerEngine:
         shutdown_failures: list[str] = []
         try:
             self._restore_orders()
-            self.quote_deadline_at = (
-                time() + self.config.run_duration_seconds
-                if self.config.run_duration_seconds > 0
-                else None
-            )
-            self.quote_task_expired = False
-            self._persist_orders()
+            self._reset_quote_task_for_start()
             if not self.config.dry_run and self.config.preflight_enabled:
                 report = await asyncio.to_thread(self.client.run_preflight, self.config)
                 self.preflight_report = report
@@ -141,11 +135,6 @@ class MarketMakerEngine:
         self.orders = {order.order_id: order for order in restored}
         restored_exits = self.journal.load_pending_exits()
         self.pending_exits = {intent.intent_id: intent for intent in restored_exits}
-        self.quote_deadline_at = self.journal.load_quote_deadline()
-        if self.quote_deadline_at is not None and self.quote_deadline_at <= time():
-            self.quote_task_expired = True
-            self.paused = True
-            logger.warning("Restored quote-task deadline has expired; quoting remains paused")
         if restored:
             logger.warning("Restored %d tracked order(s) from the crash journal", len(restored))
         if restored_exits:
@@ -153,6 +142,17 @@ class MarketMakerEngine:
                 "Restored %d pending $0.01 fill-exit order(s) from the crash journal",
                 len(restored_exits),
             )
+
+    def _reset_quote_task_for_start(self) -> None:
+        """Every explicit task start begins a fresh validity period."""
+        self.quote_deadline_at = (
+            time() + self.config.run_duration_seconds
+            if self.config.run_duration_seconds > 0
+            else None
+        )
+        self.quote_task_expired = False
+        self.paused = False
+        self._persist_orders()
 
     def _persist_orders(self) -> None:
         if self.config.dry_run:

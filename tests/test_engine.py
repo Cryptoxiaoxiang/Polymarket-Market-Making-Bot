@@ -272,7 +272,7 @@ def test_pending_fill_exit_survives_restart(tmp_path) -> None:
     assert journal.load_pending_exits() == []
 
 
-def test_expired_quote_task_pauses_cancels_and_survives_restart(tmp_path) -> None:
+def test_expired_quote_task_pauses_and_cancels(tmp_path) -> None:
     journal = OrderJournal(tmp_path / "orders.json")
     client = FakeClient(journal.path)
     client.open_orders = [{"id": "order-1"}]
@@ -288,10 +288,27 @@ def test_expired_quote_task_pauses_cancels_and_survives_restart(tmp_path) -> Non
     assert client.cancelled == ["order-1"]
     assert journal.load() == []
 
-    restored = MarketMakerEngine(_config(), FakeClient(journal.path), journal)
-    restored._restore_orders()
-    assert restored.paused is True
-    assert restored.quote_task_expired is True
+
+
+def test_each_task_start_recalculates_validity_and_clears_old_pause(tmp_path) -> None:
+    journal = OrderJournal(tmp_path / "orders.json")
+    journal.save([], quote_deadline_at=time() - 60)
+    config = BotConfig(
+        dry_run=True,
+        run_duration_seconds=5_400,
+        markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+    )
+    engine = MarketMakerEngine(config, FakeClient(journal.path), journal)
+    engine.paused = True
+    engine.quote_task_expired = True
+
+    engine._restore_orders()
+    engine._reset_quote_task_for_start()
+
+    assert engine.paused is False
+    assert engine.quote_task_expired is False
+    assert engine.quote_deadline_at is not None
+    assert 5_390 <= engine.quote_deadline_at - time() <= 5_400
 
 
 def test_setting_new_validity_resumes_an_expired_task(tmp_path) -> None:
