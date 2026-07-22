@@ -106,6 +106,7 @@ class ExitIntent:
     size: Decimal
     neg_risk: bool
     created_at: float
+    tick_size: Decimal | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -115,6 +116,7 @@ class ExitIntent:
             "size": str(self.size),
             "neg_risk": self.neg_risk,
             "created_at": self.created_at,
+            "tick_size": str(self.tick_size) if self.tick_size is not None else None,
         }
 
     @classmethod
@@ -126,6 +128,11 @@ class ExitIntent:
             size=Decimal(str(raw["size"])),
             neg_risk=bool(raw.get("neg_risk", False)),
             created_at=float(raw["created_at"]),
+            tick_size=(
+                Decimal(str(raw["tick_size"]))
+                if raw.get("tick_size") is not None
+                else None
+            ),
         )
 
 

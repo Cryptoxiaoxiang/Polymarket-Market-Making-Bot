@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import suppress
-from decimal import Decimal
+from dataclasses import replace
+from decimal import ROUND_DOWN, Decimal
 from time import monotonic, time
 
 from poly_mm.client import PolymarketClient
@@ -26,6 +27,7 @@ TERMINAL_ORDER_STATUSES = {
     "FAILED",
 }
 EXIT_LIMIT_PRICE = Decimal("0.01")
+MIN_EXIT_SIZE = Decimal("0.01")
 MISSING_ORDER_CONFIRMATION_ATTEMPTS = 3
 
 
@@ -524,6 +526,7 @@ class MarketMakerEngine:
         if size <= 0:
             return None
         intent_id = f"{order.order_id}:{order.filled_size}"
+        cached_tick = self.latest_books.get(order.quote.token_id, {}).get("tick_size")
         intent = ExitIntent(
             intent_id=intent_id,
             source_order_id=order.order_id,
@@ -531,6 +534,10 @@ class MarketMakerEngine:
             size=size,
             neg_risk=order.quote.neg_risk,
             created_at=time(),
+            # A protected exit must survive a restart even if the market closes
+            # and /book starts returning 404. $0.01 is itself a safe fallback
+            # tick for the protective limit price.
+            tick_size=(Decimal(str(cached_tick)) if cached_tick else EXIT_LIMIT_PRICE),
         )
         # Persist the intent before cancellation so a crash cannot leave
         # acquired shares without a recoverable sell instruction.
@@ -564,9 +571,14 @@ class MarketMakerEngine:
 
     async def _submit_fill_exit(self, intent: ExitIntent) -> None:
         attempt = 0
+        balance_failures = 0
         cached_book = self.latest_books.get(intent.token_id, {})
         cached_tick = cached_book.get("tick_size")
-        tick_size = Decimal(str(cached_tick)) if cached_tick else None
+        tick_size = (
+            intent.tick_size
+            or (Decimal(str(cached_tick)) if cached_tick else None)
+            or EXIT_LIMIT_PRICE
+        )
         while not self.stop.is_set() and intent.intent_id in self.pending_exits:
             attempt += 1
             quote = Quote(
@@ -582,14 +594,14 @@ class MarketMakerEngine:
                     quote,
                     post_only=False,
                     tick_size=tick_size,
+                    submission_key=intent.intent_id,
                 )
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 error_text = str(error).casefold()
-                if "tick" in error_text:
-                    tick_size = None
                 if "balance" in error_text or "allowance" in error_text:
+                    balance_failures += 1
                     try:
                         await asyncio.to_thread(
                             self.client.sync_conditional_allowance, intent.token_id
@@ -600,6 +612,52 @@ class MarketMakerEngine:
                             intent.token_id,
                             sync_error,
                         )
+                    if balance_failures >= 3:
+                        try:
+                            available = await asyncio.to_thread(
+                                self.client.get_conditional_balance, intent.token_id
+                            )
+                        except Exception as balance_error:
+                            logger.warning(
+                                "Unable to read conditional balance for %s: %s",
+                                intent.token_id,
+                                balance_error,
+                            )
+                        else:
+                            sellable = available.quantize(
+                                MIN_EXIT_SIZE, rounding=ROUND_DOWN
+                            )
+                            if Decimal() < available < intent.size:
+                                self.client.discard_prepared_order(intent.intent_id)
+                                if sellable < MIN_EXIT_SIZE:
+                                    self.pending_exits.pop(intent.intent_id, None)
+                                    self._persist_orders()
+                                    logger.critical(
+                                        "$0.01 SELL already reserved or filled for %s; "
+                                        "remaining %s share(s) are below the CLOB's "
+                                        "0.01-share precision",
+                                        intent.token_id,
+                                        available,
+                                    )
+                                    return
+                                previous_size = intent.size
+                                intent = replace(
+                                    intent,
+                                    size=sellable,
+                                    tick_size=tick_size,
+                                )
+                                self.pending_exits[intent.intent_id] = intent
+                                self._persist_orders()
+                                balance_failures = 0
+                                logger.critical(
+                                    "Protective SELL resized from %s to %s share(s) "
+                                    "using CLOB available balance for %s",
+                                    previous_size,
+                                    sellable,
+                                    intent.token_id,
+                                )
+                else:
+                    balance_failures = 0
                 delay = min(
                     self._exit_retry_base_seconds * (2 ** min(attempt - 1, 4)),
                     1.6,

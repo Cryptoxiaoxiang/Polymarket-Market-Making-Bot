@@ -21,6 +21,7 @@ def test_journal_round_trip_and_private_permissions(tmp_path) -> None:
         Decimal("1.5"),
         False,
         1_700_000_001,
+        Decimal("0.01"),
     )
     journal.save([order], quote_deadline_at=1_800_000_000, pending_exits=[intent])
     restored = journal.load()

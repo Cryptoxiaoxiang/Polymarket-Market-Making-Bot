@@ -25,6 +25,7 @@ class PolymarketClient:
     def __init__(self, settings: Settings, dry_run: bool) -> None:
         self.settings, self.dry_run = settings, dry_run
         self._dry_orders: dict[str, ManagedOrder] = {}
+        self._prepared_orders: dict[str, object] = {}
         self._sdk = None
         self.websocket_connected = False
 
@@ -143,6 +144,7 @@ class PolymarketClient:
         *,
         post_only: bool = True,
         tick_size: Decimal | None = None,
+        submission_key: str | None = None,
     ) -> ManagedOrder:
         if self.dry_run:
             order = ManagedOrder(f"dry-{uuid4().hex[:12]}", quote, time())
@@ -160,25 +162,46 @@ class PolymarketClient:
         from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions
         from py_clob_client_v2.order_builder.constants import BUY, SELL
         resolved_tick_size = tick_size or self.get_orderbook(quote.token_id).tick_size
-        result = sdk.create_and_post_order(
-            order_args=OrderArgs(
-                token_id=quote.token_id,
-                price=float(quote.price),
-                size=float(quote.size),
-                side=BUY if quote.side == Side.BUY else SELL,
-            ),
-            options=PartialCreateOrderOptions(
-                tick_size=str(resolved_tick_size), neg_risk=quote.neg_risk
-            ),
-            order_type=OrderType.GTC,
-            post_only=post_only,
+        order_args = OrderArgs(
+            token_id=quote.token_id,
+            price=float(quote.price),
+            size=float(quote.size),
+            side=BUY if quote.side == Side.BUY else SELL,
         )
+        options = PartialCreateOrderOptions(
+            tick_size=str(resolved_tick_size), neg_risk=quote.neg_risk
+        )
+        if submission_key:
+            # A POST can reach the CLOB even when its HTTP response is lost.
+            # Re-post the exact same signed order on retry so its order hash
+            # remains stable instead of reserving shares a second time.
+            prepared = self._prepared_orders.get(submission_key)
+            if prepared is None:
+                prepared = sdk.create_order(order_args=order_args, options=options)
+                self._prepared_orders[submission_key] = prepared
+            result = sdk.post_order(
+                prepared,
+                order_type=OrderType.GTC,
+                post_only=post_only,
+            )
+        else:
+            result = sdk.create_and_post_order(
+                order_args=order_args,
+                options=options,
+                order_type=OrderType.GTC,
+                post_only=post_only,
+            )
         if result.get("success") is False:
             raise RuntimeError(f"CLOB rejected order: {result.get('errorMsg') or result}")
         order_id = str(result.get("orderID") or result.get("order_id") or result.get("id") or "")
         if not order_id:
             raise RuntimeError(f"CLOB did not return an order ID: {result}")
+        if submission_key:
+            self._prepared_orders.pop(submission_key, None)
         return ManagedOrder(order_id, quote, time())
+
+    def discard_prepared_order(self, submission_key: str) -> None:
+        self._prepared_orders.pop(submission_key, None)
 
     def sync_conditional_allowance(self, token_id: str) -> None:
         """Refresh CLOB's conditional-token balance cache before a SELL."""
@@ -193,6 +216,21 @@ class PolymarketClient:
                 signature_type=self.settings.signature_type,
             )
         )
+
+    def get_conditional_balance(self, token_id: str) -> Decimal:
+        """Return the currently available conditional-token shares."""
+        if self.dry_run:
+            return Decimal()
+        from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+
+        raw = self._authenticated_sdk().get_balance_allowance(
+            BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+                signature_type=self.settings.signature_type,
+            )
+        )
+        return Decimal(str(raw.get("balance") or "0")) / COLLATERAL_SCALE
 
     def cancel_order(self, order_id: str) -> None:
         if self.dry_run:

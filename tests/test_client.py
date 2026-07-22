@@ -70,6 +70,44 @@ def test_cached_tick_size_skips_orderbook_request() -> None:
     client.get_orderbook.assert_not_called()
 
 
+def test_submission_retry_reuses_the_same_signed_order() -> None:
+    sdk = Mock()
+    prepared = object()
+    sdk.create_order.return_value = prepared
+    sdk.post_order.side_effect = [
+        RuntimeError("Request exception"),
+        {"success": True, "orderID": "sell-1"},
+    ]
+    client = PolymarketClient(Settings(private_key="0x" + "1" * 64), dry_run=False)
+    client._sdk = sdk
+    quote = Quote("token-1", Side.SELL, Decimal("0.01"), Decimal("1.18"))
+
+    try:
+        client.create_order(
+            quote,
+            post_only=False,
+            tick_size=Decimal("0.01"),
+            submission_key="fill-1",
+        )
+    except RuntimeError as error:
+        assert str(error) == "Request exception"
+    else:
+        raise AssertionError("first post should simulate a lost HTTP response")
+
+    order = client.create_order(
+        quote,
+        post_only=False,
+        tick_size=Decimal("0.01"),
+        submission_key="fill-1",
+    )
+
+    assert order.order_id == "sell-1"
+    sdk.create_order.assert_called_once()
+    assert sdk.post_order.call_count == 2
+    assert all(call.args[0] is prepared for call in sdk.post_order.call_args_list)
+    assert client._prepared_orders == {}
+
+
 def test_order_matched_shares_is_recovered_from_taker_and_maker_trades() -> None:
     sdk = Mock()
     sdk.get_trades.return_value = [

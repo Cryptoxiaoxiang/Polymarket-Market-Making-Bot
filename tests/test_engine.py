@@ -22,8 +22,10 @@ class FakeClient:
         self.cancelled: list[str] = []
         self.created: list[tuple[Quote, bool]] = []
         self.synced_tokens: list[str] = []
+        self.discarded_submission_keys: list[str] = []
         self.matched_shares = Decimal()
         self.positions: dict[str, Decimal] = {}
+        self.conditional_balance = Decimal("1000000")
 
     def get_order(self, order_id: str) -> dict:
         return self.order_state
@@ -50,12 +52,19 @@ class FakeClient:
     def sync_conditional_allowance(self, token_id: str) -> None:
         self.synced_tokens.append(token_id)
 
+    def get_conditional_balance(self, token_id: str) -> Decimal:
+        return self.conditional_balance
+
+    def discard_prepared_order(self, submission_key: str) -> None:
+        self.discarded_submission_keys.append(submission_key)
+
     def create_order(
         self,
         quote: Quote,
         *,
         post_only: bool = True,
         tick_size: Decimal | None = None,
+        submission_key: str | None = None,
     ) -> ManagedOrder:
         self.created.append((quote, post_only))
         return ManagedOrder("exit-order", quote, time())
@@ -278,11 +287,15 @@ def test_fill_exit_starts_before_buy_cancellation_finishes(tmp_path) -> None:
             *,
             post_only: bool = True,
             tick_size: Decimal | None = None,
+            submission_key: str | None = None,
         ) -> ManagedOrder:
             if quote.side == Side.SELL:
                 self.sell_started.set()
             return super().create_order(
-                quote, post_only=post_only, tick_size=tick_size
+                quote,
+                post_only=post_only,
+                tick_size=tick_size,
+                submission_key=submission_key,
             )
 
     client = SlowCancelClient(tmp_path / "orders.json")
@@ -320,12 +333,16 @@ def test_fill_exit_retries_until_shares_are_available(tmp_path) -> None:
             *,
             post_only: bool = True,
             tick_size: Decimal | None = None,
+            submission_key: str | None = None,
         ) -> ManagedOrder:
             self.attempts += 1
             if self.attempts == 1:
                 raise RuntimeError("not enough balance / allowance")
             return super().create_order(
-                quote, post_only=post_only, tick_size=tick_size
+                quote,
+                post_only=post_only,
+                tick_size=tick_size,
+                submission_key=submission_key,
             )
 
     client = DelayedSharesClient(tmp_path / "orders.json")
@@ -353,6 +370,52 @@ def test_fill_exit_retries_until_shares_are_available(tmp_path) -> None:
     assert client.synced_tokens == ["token-1"]
     assert client.created[0][0].size == Decimal("2")
     assert engine.pending_exits == {}
+
+
+def test_fill_exit_clears_untradeable_residue_after_repeated_balance_errors(
+    tmp_path,
+) -> None:
+    class ReservedSharesClient(FakeClient):
+        def __init__(self, journal_path) -> None:
+            super().__init__(journal_path)
+            self.attempts = 0
+            self.conditional_balance = Decimal("0.00888")
+
+        def create_order(
+            self,
+            quote: Quote,
+            *,
+            post_only: bool = True,
+            tick_size: Decimal | None = None,
+            submission_key: str | None = None,
+        ) -> ManagedOrder:
+            self.attempts += 1
+            raise RuntimeError("not enough balance / allowance")
+
+    client = ReservedSharesClient(tmp_path / "orders.json")
+    engine = MarketMakerEngine(
+        BotConfig(
+            sell_on_fill=True,
+            cancel_retry_base_seconds=0,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+    )
+    engine._exit_retry_base_seconds = 0
+    order = _order()
+    order.filled_size = Decimal("1.18888")
+    engine.orders = {order.order_id: order}
+
+    async def scenario() -> None:
+        await engine._handle_fill(order, source="REST post-cancellation reconciliation")
+        await asyncio.gather(*engine._exit_tasks)
+
+    asyncio.run(scenario())
+
+    assert client.attempts == 3
+    assert client.discarded_submission_keys == ["order-1:1.18888"]
+    assert engine.pending_exits == {}
+    assert OrderJournal(tmp_path / "orders.json").load_pending_exits() == []
 
 
 def test_position_increase_for_tracked_buy_submits_fill_exit(tmp_path) -> None:
