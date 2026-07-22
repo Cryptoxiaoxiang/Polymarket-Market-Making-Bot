@@ -77,6 +77,10 @@ def test_console_status_and_pause_action_without_login(tmp_path) -> None:
             assert status == 200
             assert ".app-shell" in styles
 
+            logo_request = Request(f"{origin}/static/polymarket-icon-white.png")
+            logo = await asyncio.to_thread(lambda: urlopen(logo_request).read())
+            assert logo.startswith(b"\x89PNG")
+
             script_request = Request(f"{origin}/static/app.js")
             status, script = await asyncio.to_thread(_read, script_request)
             assert status == 200

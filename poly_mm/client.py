@@ -86,11 +86,14 @@ class PolymarketClient:
         if not allowances:
             raise RuntimeError("CLOB returned no collateral allowance values")
         minimum_allowance = min(allowances)
-        required = config.risk.max_total_open_notional
+        # Outcome-token prices cannot exceed 1 pUSD, so one maximum-sized order
+        # needs at most max_order_size pUSD. The total-open-shares limit is not a
+        # currency amount and must not be compared directly with collateral.
+        required = config.risk.max_order_size
         if balance < required:
             raise RuntimeError(
                 "Insufficient pUSD balance: "
-                f"{balance} available, {required} required by risk.max_total_open_notional"
+                f"{balance} available, {required} required for one maximum-sized order"
             )
         if minimum_allowance < required:
             raise RuntimeError(

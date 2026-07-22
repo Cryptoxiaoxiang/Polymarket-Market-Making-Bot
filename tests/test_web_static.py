@@ -28,3 +28,27 @@ def test_quote_settings_replace_misleading_read_only_summary() -> None:
     assert "风险与刷新" not in html
     assert "fetch('/api/resolve-market'" in javascript
     assert "action('/api/setup'" in javascript
+
+
+def test_dashboard_uses_confirmed_modern_empty_state_without_market_module() -> None:
+    static_dir = Path(__file__).parents[1] / "poly_mm" / "web_static"
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    javascript = (static_dir / "app.js").read_text(encoding="utf-8")
+
+    assert "做市控制台" in html
+    assert 'id="open-orders-empty"' in html
+    assert "尚未创建挂单任务" in html
+    assert "市场与仓位" not in html
+    assert 'id="markets-list"' not in html
+    assert "byId('markets-list')" not in javascript
+    assert 'href="https://x.com/cryptoxiaoxiang"' in html
+    assert "@cryptoxiaoxiang" in html
+
+
+def test_sidebar_uses_official_polymarket_icon_asset() -> None:
+    static_dir = Path(__file__).parents[1] / "poly_mm" / "web_static"
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
+
+    assert 'src="/static/polymarket-icon-white.png"' in html
+    assert (static_dir / "polymarket-icon-white.png").is_file()
+    assert '<div class="brand-logo">P</div>' not in html

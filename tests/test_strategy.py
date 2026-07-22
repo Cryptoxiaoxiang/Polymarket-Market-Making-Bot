@@ -26,3 +26,24 @@ def test_risk_counts_existing_positions() -> None:
     risk = RiskManager(RiskConfig(max_position_per_token=Decimal("5")))
 
     assert not risk.approve(quote, [], {"yes": Decimal("1")})
+
+
+def test_risk_caps_total_remaining_open_order_shares_not_notional() -> None:
+    from poly_mm.config import RiskConfig
+    from poly_mm.models import ManagedOrder, Quote, Side
+    from poly_mm.risk import RiskManager
+
+    existing = ManagedOrder(
+        "order-1",
+        Quote("no", Side.BUY, Decimal(".01"), Decimal("5")),
+        1_700_000_000,
+        filled_size=Decimal("2"),
+    )
+    risk = RiskManager(RiskConfig(max_total_open_shares=Decimal("6")))
+
+    assert risk.approve(
+        Quote("yes", Side.BUY, Decimal(".99"), Decimal("3")), [existing]
+    )
+    assert not risk.approve(
+        Quote("yes", Side.BUY, Decimal(".01"), Decimal("3.01")), [existing]
+    )

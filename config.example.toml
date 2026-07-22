@@ -1,7 +1,7 @@
 # Live trading is the default. Change to true when you only want a simulation.
 dry_run = false
 poll_interval_seconds = 2.0
-cancel_after_seconds = 10.0
+cancel_after_seconds = 8.0
 run_duration_seconds = 0
 cancel_all_on_start = true
 cancel_all_on_shutdown = true
@@ -32,6 +32,6 @@ max_spread = "0.15"
 
 [risk]
 max_order_size = "5"
-max_position_per_token = "5"
-max_total_open_notional = "5"
+max_position_per_token = "100"
+max_total_open_shares = "5"
 max_open_orders_per_token = 1

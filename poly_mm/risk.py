@@ -27,5 +27,8 @@ class RiskManager:
         )
         if token_shares + quote.size > self.config.max_position_per_token:
             return False
-        open_notional = sum((order.quote.price * order.quote.size for order in orders), Decimal())
-        return open_notional + quote.price * quote.size <= self.config.max_total_open_notional
+        open_shares = sum(
+            (max(Decimal(), order.quote.size - order.filled_size) for order in orders),
+            Decimal(),
+        )
+        return open_shares + quote.size <= self.config.max_total_open_shares

@@ -2,6 +2,27 @@ const byId = (id) => document.getElementById(id);
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
 }[character]));
+const numberValue = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+function formatDuration(startedAt) {
+  if (!startedAt) return '—';
+  const seconds = Math.max(0, Math.floor(Date.now() / 1000 - Number(startedAt)));
+  if (!Number.isFinite(seconds)) return '—';
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (hours >= 24) return `${Math.floor(hours / 24)}天 ${hours % 24}时`;
+  if (hours) return `${hours}时 ${minutes}分`;
+  return `${minutes}分`;
+}
+
+function setTaskState(id, text, tone = '') {
+  const node = byId(id);
+  node.textContent = text;
+  node.className = tone;
+}
 
 const setupForm = byId('setup-form');
 const setupMarketsList = byId('setup-markets-list');
@@ -185,49 +206,62 @@ function render(status) {
   const configuration = status.configuration || {};
   const preflight = status.preflight;
   const running = Boolean(status.running);
-  const marketCount = Number(configuration.market_count ?? status.markets.length ?? 0);
+  const orders = Array.isArray(status.orders) ? status.orders : [];
+  const markets = Array.isArray(status.markets) ? status.markets : [];
+  const marketCount = Number(configuration.market_count ?? markets.length ?? 0);
 
   const phaseLabels = {
     running: '运行中', starting: '启动检查中', stopping: '停止中', stopped: '已停止', error: '运行错误', created: '待启动',
   };
   const phaseLabel = phaseLabels[status.phase] || String(status.phase || '未知');
-  byId('run-status').textContent = phaseLabel;
-  byId('run-status').className = `metric-value ${status.phase === 'running' ? 'positive' : status.phase === 'error' ? 'negative' : 'warning'}`;
-  byId('run-status-note').textContent = running ? (status.paused ? '任务已暂停，不会创建新挂单' : '机器人正在管理报价') : (status.last_error || '网页服务正常，可从页面启动任务');
+  byId('sidebar-run-status').textContent = phaseLabel;
   byId('mode-badge').textContent = status.dry_run ? '模拟模式' : '实盘模式';
-  byId('mode-badge').className = `pill${status.dry_run ? '' : ' live'}`;
+  byId('mode-badge').className = `mode-tag ${status.dry_run ? 'dry' : 'live'}`;
+  byId('mode-badge').insertAdjacentHTML('afterbegin', '<span class="dot"></span>');
 
-  byId('open-order-value').textContent = String(status.orders.length);
-  byId('open-order-note').textContent = status.orders.length ? '机器人正在管理开放订单' : '暂无机器人管理的挂单';
-  byId('open-orders-summary').textContent = status.orders.length ? `${status.orders.length} 笔开放订单` : '暂无挂单';
-  byId('market-value').textContent = `${marketCount} 个市场`;
-  byId('configured-note').textContent = status.dry_run ? '当前为模拟模式' : '当前为实盘模式';
+  const totalPositionNotional = markets.reduce((total, market) => {
+    const bid = numberValue(market.book?.best_bid);
+    const ask = numberValue(market.book?.best_ask);
+    const mark = bid && ask ? (bid + ask) / 2 : bid || ask;
+    return total + Math.abs(numberValue(market.position)) * mark;
+  }, 0);
+  const openNotional = orders.reduce((total, order) => {
+    const remaining = Math.max(0, numberValue(order.size) - numberValue(order.filled_size));
+    return total + numberValue(order.price) * remaining;
+  }, 0);
+  byId('open-order-value').textContent = String(orders.length);
+  byId('open-order-note').textContent = orders.length ? '机器人正在管理开放订单' : '当前活跃挂单数量';
+  byId('total-position-value').textContent = totalPositionNotional.toFixed(2);
+  byId('open-notional-value').textContent = `$${openNotional.toFixed(2)}`;
+  byId('uptime-value').textContent = running ? formatDuration(status.started_at) : '—';
+  byId('uptime-note').textContent = running ? (status.paused ? '任务已暂停' : '机器人累计运行时长') : '机器人累计运行时长';
+  byId('open-orders-summary').textContent = orders.length ? `${orders.length} 笔开放订单` : '暂无挂单';
   byId('market-count').textContent = String(marketCount);
 
-  byId('balance-value').textContent = preflight ? `${preflight.collateral_balance} pUSD` : '尚未预检';
-  byId('balance-note').textContent = preflight ? `最小 allowance ${preflight.minimum_allowance}` : '预检后显示可用抵押余额';
-  byId('account-state').textContent = account.ready ? '账户已连接' : '配置不完整';
-  byId('ws-state').textContent = status.websocket_connected ? '已连接' : (status.dry_run ? '模拟模式未启用' : '未连接');
-  byId('fill-guard').textContent = configuration.halt_on_fill ? '已启用' : '未启用';
-  byId('guard-badge').innerHTML = `<span class="dot"></span>${account.ready ? '保护已加载' : '等待账户配置'}`;
-  byId('guard-badge').className = `status-badge${account.ready ? '' : ' warning'}`;
+  const strategyConfigured = numberValue(configuration.cancel_after_seconds) > 0;
+  const riskConfigured = numberValue(configuration.max_position_per_token) > 0
+    && numberValue(configuration.max_total_open_shares) > 0;
+  const accountReady = status.dry_run || Boolean(account.ready);
+  const ready = accountReady && strategyConfigured && riskConfigured && marketCount > 0;
+  setTaskState('task-signer-state', account.ready ? '已配置' : status.dry_run ? '模拟模式' : '未配置', accountReady ? 'positive' : 'warning');
+  setTaskState('task-rpc-state', status.websocket_connected ? '已连接' : '未连接', status.websocket_connected ? 'positive' : '');
+  setTaskState('task-strategy-state', strategyConfigured ? '已配置' : '未配置', strategyConfigured ? 'positive' : 'warning');
+  setTaskState('task-risk-state', riskConfigured ? '已配置' : '未配置', riskConfigured ? 'positive' : 'warning');
+  setTaskState('task-market-state', marketCount ? `${marketCount} 个市场` : '未配置', marketCount ? 'positive' : 'warning');
+  setTaskState('task-ready-state', running ? phaseLabel : ready ? '可启动' : '未就绪', running || ready ? 'positive' : 'warning');
+  byId('guard-badge').innerHTML = `<span class="dot"></span>${running ? phaseLabel : ready ? '已就绪' : '未就绪'}`;
+  byId('guard-badge').className = `status-badge${running || ready ? '' : ' warning'}`;
 
   const preflightText = preflight
     ? `Signer ${preflight.signer_address} · pUSD ${preflight.collateral_balance} · 最小 allowance ${preflight.minimum_allowance} · ${preflight.country || '—'}/${preflight.region || '—'}`
     : '尚未运行预检。保存账户后，可在账户设置页执行不会下单的实盘检查。';
-  byId('preflight-summary').textContent = preflightText;
   byId('preflight-detail').textContent = preflightText;
   byId('preflight-status').textContent = preflight ? '预检已通过' : '尚未检查';
 
-  const labelsByToken = new Map(status.markets.map((market) => [market.token_id, market.label]));
-  byId('open-orders-list').innerHTML = status.orders.length
-    ? status.orders.map((order) => `<tr><td>${marketCell(labelsByToken.get(order.token_id) || order.token_id)}</td><td><span class="side-badge">${escapeHtml(order.side)}</span></td><td class="order-price">${escapeHtml(order.price)}</td><td>${escapeHtml(order.size)}</td><td>${escapeHtml(order.age_seconds)} 秒</td></tr>`).join('')
-    : '<tr class="empty-row"><td colspan="5">机器人当前没有管理中的挂单。</td></tr>';
-
-  byId('markets-list').innerHTML = status.markets.length
-    ? status.markets.map((market) => `<tr><td>${marketCell(market.label, market.token_id || '')}</td><td>${escapeHtml(market.position)}</td><td>${escapeHtml(market.book.best_bid || '—')}</td><td>${escapeHtml(market.book.best_ask || '—')}</td><td>${escapeHtml(market.book.spread || '—')}</td><td><span class="side-badge${market.halted ? ' warning' : ''}">${market.halted ? '已停止' : '正常'}</span></td></tr>`).join('')
-    : '<tr class="empty-row"><td colspan="6">当前没有已配置市场。</td></tr>';
-  byId('markets-summary').textContent = `${status.markets.length} 个 outcome`;
+  const labelsByToken = new Map(markets.map((market) => [market.token_id, market.label]));
+  byId('open-orders-list').innerHTML = orders.map((order) => `<tr><td>${marketCell(labelsByToken.get(order.token_id) || order.token_id)}</td><td><span class="side-badge">${escapeHtml(order.side)}</span></td><td class="order-price">${escapeHtml(order.price)}</td><td>${escapeHtml(order.size)}</td><td>${escapeHtml(order.age_seconds)} 秒</td></tr>`).join('');
+  byId('open-orders-table').hidden = orders.length === 0;
+  byId('open-orders-empty').hidden = orders.length > 0;
 
   byId('account-badge').textContent = account.ready ? '账户已连接' : '账户配置不完整';
   byId('account-badge').className = `pill${account.ready ? '' : ' live'}`;
@@ -242,7 +276,7 @@ function render(status) {
     byId('funder-address').value = account.funder_configured ? (account.funder_address || '') : '';
   }
 
-  const canStart = !running && (status.dry_run || account.ready);
+  const canStart = !running && ready;
   byId('start-button').disabled = !canStart;
   byId('stop-button').disabled = !running;
   byId('pause-button').disabled = !running;
@@ -252,7 +286,7 @@ function render(status) {
 
   if (!setupFormDirty) {
     setupForm.elements.namedItem('max_position_per_token').value = configuration.max_position_per_token ?? '';
-    setupForm.elements.namedItem('max_total_open_notional').value = configuration.max_total_open_notional ?? '';
+    setupForm.elements.namedItem('max_total_open_shares').value = configuration.max_total_open_shares ?? '';
     setupForm.elements.namedItem('cancel_after_seconds').value = configuration.cancel_after_seconds ?? '';
     setupForm.elements.namedItem('dry_run').checked = Boolean(status.dry_run);
     const durationMinutes = Math.floor(Number(configuration.run_duration_seconds || 0) / 60);
@@ -321,7 +355,8 @@ async function refreshLogs({ force = false } = {}) {
     logs.textContent = lines.length ? lines.join('\n') : '暂无运行日志。';
     logs.scrollTop = logs.scrollHeight;
     const preview = byId('dashboard-logs');
-    preview.textContent = lines.length ? lines.slice(-6).join('\n') : '暂无运行日志。';
+    preview.textContent = lines.length ? lines.slice(-8).join('\n') : '暂无活动记录\n系统活动将显示在此处。';
+    preview.classList.toggle('empty', lines.length === 0);
     preview.scrollTop = preview.scrollHeight;
     logRefreshPending = false;
   } catch (error) {
@@ -386,6 +421,11 @@ byId('pause-button').addEventListener('click', () => action('/api/pause'));
 byId('resume-button').addEventListener('click', () => action('/api/resume'));
 byId('run-preflight').addEventListener('click', () => action('/api/preflight'));
 byId('refresh-logs').addEventListener('click', () => refreshLogs({ force: true }));
+byId('dashboard-add-market').addEventListener('click', () => {
+  showView('tasks');
+  addSetupMarket();
+  setupFormDirty = true;
+});
 
 byId('account-form').addEventListener('input', () => { accountFormDirty = true; });
 byId('account-form').addEventListener('submit', async (event) => {
@@ -421,7 +461,7 @@ setupForm.addEventListener('submit', async (event) => {
   const saved = await action('/api/setup', { body: {
     markets,
     max_position_per_token: setupForm.elements.namedItem('max_position_per_token').value,
-    max_total_open_notional: setupForm.elements.namedItem('max_total_open_notional').value,
+    max_total_open_shares: setupForm.elements.namedItem('max_total_open_shares').value,
     cancel_after_seconds: setupForm.elements.namedItem('cancel_after_seconds').value,
     run_duration_enabled: runDurationEnabled.checked,
     run_duration_hours: Number(runDurationHours.value),
@@ -435,7 +475,7 @@ byId('clear-setup').addEventListener('click', async () => {
   const saved = await action('/api/setup', { body: {
     markets: [],
     max_position_per_token: setupForm.elements.namedItem('max_position_per_token').value,
-    max_total_open_notional: setupForm.elements.namedItem('max_total_open_notional').value,
+    max_total_open_shares: setupForm.elements.namedItem('max_total_open_shares').value,
     cancel_after_seconds: setupForm.elements.namedItem('cancel_after_seconds').value,
     run_duration_enabled: false,
     run_duration_hours: 0,

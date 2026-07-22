@@ -91,7 +91,7 @@ cp .env.example .env
 ```
 
 默认配置已经是 `dry_run = false`。第一笔实盘建议把 `quote_size`、
-`max_order_size`、`max_position_per_token` 和 `max_total_open_notional` 都维持在
+`max_order_size`、`max_position_per_token` 和 `max_total_open_shares` 都维持在
 交易所允许的最小值附近。
 
 ## 与 Predictfun 共用一台 VPS

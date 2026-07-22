@@ -10,7 +10,7 @@ from poly_mm.config import BotConfig, MarketConfig, RiskConfig, Settings
 def _live_config(required: str = "100") -> BotConfig:
     return BotConfig(
         dry_run=False,
-        risk=RiskConfig(max_total_open_notional=Decimal(required)),
+        risk=RiskConfig(max_order_size=Decimal(required)),
         markets=[MarketConfig(token_id="token-1")],
     )
 

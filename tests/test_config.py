@@ -11,8 +11,19 @@ def test_example_config_defaults_to_live_trading() -> None:
 
     assert config.dry_run is False
     assert config.preflight_enabled is True
-    assert str(config.risk.max_total_open_notional) == "5"
+    assert str(config.risk.max_total_open_shares) == "5"
     assert config.markets == []
+
+
+def test_legacy_total_open_notional_key_loads_as_share_limit(tmp_path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[risk]\nmax_total_open_notional = "42"\n', encoding="utf-8"
+    )
+
+    config = load_config(path, require_markets=False)
+
+    assert config.risk.max_total_open_shares == Decimal("42")
 
 
 def test_trading_config_requires_an_enabled_market(tmp_path) -> None:

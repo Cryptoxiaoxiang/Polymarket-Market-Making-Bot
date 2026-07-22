@@ -63,8 +63,8 @@ class StrategyConfig:
 @dataclass(frozen=True)
 class RiskConfig:
     max_order_size: Decimal = Decimal("10")
-    max_position_per_token: Decimal = Decimal("25")
-    max_total_open_notional: Decimal = Decimal("100")
+    max_position_per_token: Decimal = Decimal("100")
+    max_total_open_shares: Decimal = Decimal("100")
     max_open_orders_per_token: int = 1
 
 
@@ -72,7 +72,7 @@ class RiskConfig:
 class BotConfig:
     dry_run: bool = False
     poll_interval_seconds: float = 2
-    cancel_after_seconds: float = 10
+    cancel_after_seconds: float = 8
     run_duration_seconds: int = 0
     cancel_all_on_start: bool = True
     cancel_all_on_shutdown: bool = True
@@ -101,10 +101,18 @@ def load_config(path: str | Path, *, require_markets: bool = True) -> BotConfig:
     strategy = StrategyConfig(
         **_decimal_fields(strategy_raw, {"quote_size", "min_spread", "max_spread"})
     )
+    # Read the old notional key as a shares limit so existing installations can
+    # upgrade without failing to start. Newly written configs only use the new name.
+    if (
+        "max_total_open_shares" not in risk_raw
+        and "max_total_open_notional" in risk_raw
+    ):
+        risk_raw = dict(risk_raw)
+        risk_raw["max_total_open_shares"] = risk_raw.pop("max_total_open_notional")
     risk = RiskConfig(
         **_decimal_fields(
             risk_raw,
-            {"max_order_size", "max_position_per_token", "max_total_open_notional"},
+            {"max_order_size", "max_position_per_token", "max_total_open_shares"},
         )
     )
     markets = [
@@ -113,7 +121,7 @@ def load_config(path: str | Path, *, require_markets: bool = True) -> BotConfig:
     config = BotConfig(
         dry_run=bool(data.get("dry_run", False)),
         poll_interval_seconds=float(data.get("poll_interval_seconds", 2)),
-        cancel_after_seconds=float(data.get("cancel_after_seconds", 10)),
+        cancel_after_seconds=float(data.get("cancel_after_seconds", 8)),
         run_duration_seconds=max(0, int(data.get("run_duration_seconds", 0))),
         cancel_all_on_start=bool(data.get("cancel_all_on_start", True)),
         cancel_all_on_shutdown=bool(data.get("cancel_all_on_shutdown", True)),
@@ -165,7 +173,7 @@ def load_config(path: str | Path, *, require_markets: bool = True) -> BotConfig:
     if (
         config.risk.max_order_size <= 0
         or config.risk.max_position_per_token <= 0
-        or config.risk.max_total_open_notional <= 0
+        or config.risk.max_total_open_shares <= 0
     ):
         raise ValueError("risk limits must be positive")
     if config.risk.max_open_orders_per_token < 1:
@@ -232,7 +240,7 @@ def _config_text(config: BotConfig) -> str:
             "[risk]",
             f'max_order_size = "{config.risk.max_order_size}"',
             f'max_position_per_token = "{config.risk.max_position_per_token}"',
-            f'max_total_open_notional = "{config.risk.max_total_open_notional}"',
+            f'max_total_open_shares = "{config.risk.max_total_open_shares}"',
             f"max_open_orders_per_token = {config.risk.max_open_orders_per_token}",
             "",
         ]
