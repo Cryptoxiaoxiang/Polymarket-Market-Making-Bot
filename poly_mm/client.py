@@ -10,7 +10,7 @@ from uuid import uuid4
 import requests
 
 from poly_mm.config import BotConfig, Settings
-from poly_mm.models import Level, ManagedOrder, OrderBook, PreflightReport, Quote
+from poly_mm.models import Level, ManagedOrder, OrderBook, PreflightReport, Quote, Side
 
 logger = logging.getLogger("poly-mm")
 COLLATERAL_SCALE = Decimal(10**6)
@@ -137,33 +137,35 @@ class PolymarketClient:
             neg_risk=bool(data.get("neg_risk", False)),
         )
 
-    def create_order(self, quote: Quote) -> ManagedOrder:
+    def create_order(self, quote: Quote, *, post_only: bool = True) -> ManagedOrder:
         if self.dry_run:
             order = ManagedOrder(f"dry-{uuid4().hex[:12]}", quote, time())
             self._dry_orders[order.order_id] = order
             logger.info(
-                "DRY-RUN would post BUY %s shares @ %s (%s)",
+                "DRY-RUN would post %s %s shares @ %s (%s), post_only=%s",
+                quote.side.value,
                 quote.size,
                 quote.price,
                 quote.token_id,
+                post_only,
             )
             return order
         sdk = self._authenticated_sdk()
         from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions
-        from py_clob_client_v2.order_builder.constants import BUY
+        from py_clob_client_v2.order_builder.constants import BUY, SELL
         book = self.get_orderbook(quote.token_id)
         result = sdk.create_and_post_order(
             order_args=OrderArgs(
                 token_id=quote.token_id,
                 price=float(quote.price),
                 size=float(quote.size),
-                side=BUY,
+                side=BUY if quote.side == Side.BUY else SELL,
             ),
             options=PartialCreateOrderOptions(
                 tick_size=str(book.tick_size), neg_risk=quote.neg_risk
             ),
             order_type=OrderType.GTC,
-            post_only=True,
+            post_only=post_only,
         )
         if result.get("success") is False:
             raise RuntimeError(f"CLOB rejected order: {result.get('errorMsg') or result}")
@@ -171,6 +173,20 @@ class PolymarketClient:
         if not order_id:
             raise RuntimeError(f"CLOB did not return an order ID: {result}")
         return ManagedOrder(order_id, quote, time())
+
+    def sync_conditional_allowance(self, token_id: str) -> None:
+        """Refresh CLOB's conditional-token balance cache before a SELL."""
+        if self.dry_run:
+            return
+        from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+
+        self._authenticated_sdk().update_balance_allowance(
+            BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+                signature_type=self.settings.signature_type,
+            )
+        )
 
     def cancel_order(self, order_id: str) -> None:
         if self.dry_run:

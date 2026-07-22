@@ -23,7 +23,9 @@
 - User WebSocket 快速接收 order/trade 更新，同时持续用 REST 对账，避免 WebSocket
   断线导致漏报。
 - Data API 定期同步已有仓位；发现任何已有仓位或部分成交后，默认停止该 token 并
-  可靠撤销其剩余订单。
+  可靠撤销其剩余买单。机器人检测到自己 BUY 订单的新增成交份数后，会持久化卖出
+  意图、刷新 conditional-token allowance，并以 `$0.01` 提交同等份数的非 post-only
+  GTC 限价 SELL；份额尚未可用时会自动重试。这可能穿过价差并造成明显亏损。
 - 每次下单后原子写入权限为 `0600` 的恢复日志。实盘重启时默认先撤掉这个账户在所配
   token 上的全部订单，再确认订单列表为空，以覆盖“CLOB 已接单、进程尚未来得及写
   日志”这一崩溃窗口。
@@ -185,6 +187,8 @@ SSH 隧道访问。
 - `console_enabled` / `console_host` / `console_port`：本机控制台；host 必须是
   loopback 地址，默认 `127.0.0.1:8081`。
 - `halt_on_fill`：任何部分成交或已有仓位出现后停止该 token。
+- `sell_on_fill`：机器人 BUY 单部分或全部成交后，以 `$0.01` 非 post-only GTC 限价单
+  卖出新增成交份数；默认开启，可能立即吃掉买盘并产生明显亏损。
 - `cancel_all_on_start`：启动时撤销配置 token 的账户订单并确认清空。
 - `cancel_all_on_shutdown`：SIGTERM/SIGINT 时撤销所有跟踪订单。
 

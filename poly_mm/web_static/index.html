@@ -126,6 +126,7 @@
                 <label class="field"><span>总最大仓位</span><input name="max_total_open_shares" inputmode="decimal" required /><small>所有未成交挂单的剩余份数总和上限</small></label>
                 <label class="field"><span>撤单等待秒数</span><input name="cancel_after_seconds" inputmode="decimal" required /><small>到达该时间后撤单并按最新盘口重新报价</small></label>
               </div>
+              <label class="switch-row"><span><strong>买单成交后立即卖出</strong><small>部分或全部成交后停止该选项继续买入，并以 $0.01 提交非 post-only 限价卖单；可能造成明显亏损</small></span><span class="switch-control"><input type="checkbox" name="sell_on_fill" checked /><i></i></span></label>
               <div class="switch-row duration-setting-row">
                 <span class="duration-setting-copy"><strong>设置挂单有效期</strong><small>默认关闭；每次启动时重新倒计时，到期后撤单并停止报价</small></span>
                 <label class="switch-control" title="是否启用挂单有效期"><input id="run-duration-enabled" type="checkbox" name="run_duration_enabled" /><i></i></label>

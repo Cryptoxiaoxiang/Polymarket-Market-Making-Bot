@@ -139,6 +139,7 @@ class DashboardController:
             "max_position_per_token": str(config.risk.max_position_per_token),
             "max_total_open_shares": str(config.risk.max_total_open_shares),
             "halt_on_fill": config.halt_on_fill,
+            "sell_on_fill": config.sell_on_fill,
             "markets": [
                 {
                     "url": market.url,
@@ -354,6 +355,11 @@ class DashboardController:
             updated = replace(
                 current,
                 dry_run=payload.get("dry_run") is True,
+                sell_on_fill=(
+                    payload.get("sell_on_fill") is True
+                    if "sell_on_fill" in payload
+                    else current.sell_on_fill
+                ),
                 cancel_after_seconds=cancel_after_seconds,
                 run_duration_seconds=run_duration_seconds,
                 markets=markets,

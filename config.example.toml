@@ -8,6 +8,9 @@ cancel_all_on_shutdown = true
 # If a quote trades even partially, stop making that token. This prevents a loop
 # from rebuilding inventory while you review the fill.
 halt_on_fill = true
+# After any partial BUY fill, submit the same number of shares as a non-post-only
+# GTC SELL limit at $0.01. This can cross the spread and realize a large loss.
+sell_on_fill = true
 # Refuse live startup if geoblock, credentials, pUSD balance, or allowances fail.
 preflight_enabled = true
 # User-channel fills are fast-path notifications; REST reconciliation remains enabled.

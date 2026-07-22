@@ -11,6 +11,7 @@ def test_example_config_defaults_to_live_trading() -> None:
 
     assert config.dry_run is False
     assert config.preflight_enabled is True
+    assert config.sell_on_fill is True
     assert str(config.risk.max_total_open_shares) == "5"
     assert config.markets == []
 

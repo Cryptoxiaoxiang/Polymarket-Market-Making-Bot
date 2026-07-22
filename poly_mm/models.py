@@ -56,6 +56,7 @@ class ManagedOrder:
     quote: Quote
     created_at: float
     filled_size: Decimal = Decimal("0")
+    exit_requested_size: Decimal = Decimal("0")
 
     @property
     def age_seconds(self) -> float:
@@ -66,6 +67,7 @@ class ManagedOrder:
             "order_id": self.order_id,
             "created_at": self.created_at,
             "filled_size": str(self.filled_size),
+            "exit_requested_size": str(self.exit_requested_size),
             "quote": {
                 "token_id": self.quote.token_id,
                 "side": self.quote.side.value,
@@ -90,6 +92,40 @@ class ManagedOrder:
             quote=quote,
             created_at=float(raw["created_at"]),
             filled_size=Decimal(str(raw.get("filled_size", "0"))),
+            exit_requested_size=Decimal(str(raw.get("exit_requested_size", "0"))),
+        )
+
+
+@dataclass(frozen=True)
+class ExitIntent:
+    """Crash-safe instruction to submit a protective sell for a detected buy fill."""
+
+    intent_id: str
+    source_order_id: str
+    token_id: str
+    size: Decimal
+    neg_risk: bool
+    created_at: float
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "intent_id": self.intent_id,
+            "source_order_id": self.source_order_id,
+            "token_id": self.token_id,
+            "size": str(self.size),
+            "neg_risk": self.neg_risk,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "ExitIntent":
+        return cls(
+            intent_id=str(raw["intent_id"]),
+            source_order_id=str(raw["source_order_id"]),
+            token_id=str(raw["token_id"]),
+            size=Decimal(str(raw["size"])),
+            neg_risk=bool(raw.get("neg_risk", False)),
+            created_at=float(raw["created_at"]),
         )
 
 

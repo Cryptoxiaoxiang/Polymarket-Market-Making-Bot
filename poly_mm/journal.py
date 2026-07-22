@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from poly_mm.models import ManagedOrder
+from poly_mm.models import ExitIntent, ManagedOrder
 
 
 class OrderJournal:
@@ -34,6 +34,13 @@ class OrderJournal:
             raise RuntimeError(f"Invalid order journal {self.path}: invalid quote deadline")
         return deadline
 
+    def load_pending_exits(self) -> list[ExitIntent]:
+        raw = self._load_payload()
+        try:
+            return [ExitIntent.from_dict(item) for item in raw.get("pending_exits", [])]
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(f"Invalid order journal {self.path}: {error}") from error
+
     def _load_payload(self) -> dict:
         if not self.path.exists():
             return {"version": 1, "orders": [], "quote_deadline_at": None}
@@ -54,12 +61,14 @@ class OrderJournal:
         orders: list[ManagedOrder],
         *,
         quote_deadline_at: float | None = None,
+        pending_exits: list[ExitIntent] | None = None,
     ) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": 1,
             "orders": [order.to_dict() for order in orders],
             "quote_deadline_at": quote_deadline_at,
+            "pending_exits": [intent.to_dict() for intent in (pending_exits or [])],
         }
         with NamedTemporaryFile(
             "w",

@@ -324,6 +324,7 @@ function render(status) {
     setupForm.elements.namedItem('max_position_per_token').value = configuration.max_position_per_token ?? '';
     setupForm.elements.namedItem('max_total_open_shares').value = configuration.max_total_open_shares ?? '';
     setupForm.elements.namedItem('cancel_after_seconds').value = configuration.cancel_after_seconds ?? '';
+    setupForm.elements.namedItem('sell_on_fill').checked = configuration.sell_on_fill !== false;
     setupForm.elements.namedItem('dry_run').checked = Boolean(status.dry_run);
     const durationMinutes = Math.floor(Number(configuration.run_duration_seconds || 0) / 60);
     runDurationEnabled.checked = durationMinutes > 0;
@@ -503,6 +504,7 @@ setupForm.addEventListener('submit', async (event) => {
     max_position_per_token: setupForm.elements.namedItem('max_position_per_token').value,
     max_total_open_shares: setupForm.elements.namedItem('max_total_open_shares').value,
     cancel_after_seconds: setupForm.elements.namedItem('cancel_after_seconds').value,
+    sell_on_fill: setupForm.elements.namedItem('sell_on_fill').checked,
     run_duration_enabled: runDurationEnabled.checked,
     run_duration_hours: Number(runDurationHours.value),
     run_duration_minutes: Number(runDurationMinutes.value),
@@ -517,6 +519,7 @@ byId('clear-setup').addEventListener('click', async (event) => {
     max_position_per_token: setupForm.elements.namedItem('max_position_per_token').value,
     max_total_open_shares: setupForm.elements.namedItem('max_total_open_shares').value,
     cancel_after_seconds: setupForm.elements.namedItem('cancel_after_seconds').value,
+    sell_on_fill: setupForm.elements.namedItem('sell_on_fill').checked,
     run_duration_enabled: false,
     run_duration_hours: 0,
     run_duration_minutes: 0,

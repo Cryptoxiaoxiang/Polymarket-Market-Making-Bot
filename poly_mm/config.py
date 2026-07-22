@@ -77,6 +77,7 @@ class BotConfig:
     cancel_all_on_start: bool = True
     cancel_all_on_shutdown: bool = True
     halt_on_fill: bool = True
+    sell_on_fill: bool = True
     preflight_enabled: bool = True
     websocket_enabled: bool = True
     position_poll_interval_seconds: float = 5
@@ -126,6 +127,7 @@ def load_config(path: str | Path, *, require_markets: bool = True) -> BotConfig:
         cancel_all_on_start=bool(data.get("cancel_all_on_start", True)),
         cancel_all_on_shutdown=bool(data.get("cancel_all_on_shutdown", True)),
         halt_on_fill=bool(data.get("halt_on_fill", True)),
+        sell_on_fill=bool(data.get("sell_on_fill", True)),
         preflight_enabled=bool(data.get("preflight_enabled", True)),
         websocket_enabled=bool(data.get("websocket_enabled", True)),
         position_poll_interval_seconds=float(
@@ -203,6 +205,7 @@ def _config_text(config: BotConfig) -> str:
         f"cancel_all_on_start = {_toml_bool(config.cancel_all_on_start)}",
         f"cancel_all_on_shutdown = {_toml_bool(config.cancel_all_on_shutdown)}",
         f"halt_on_fill = {_toml_bool(config.halt_on_fill)}",
+        f"sell_on_fill = {_toml_bool(config.sell_on_fill)}",
         f"preflight_enabled = {_toml_bool(config.preflight_enabled)}",
         f"websocket_enabled = {_toml_bool(config.websocket_enabled)}",
         f"position_poll_interval_seconds = {config.position_poll_interval_seconds}",

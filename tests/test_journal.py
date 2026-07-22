@@ -1,7 +1,7 @@
 from decimal import Decimal
 
 from poly_mm.journal import OrderJournal
-from poly_mm.models import ManagedOrder, Quote, Side
+from poly_mm.models import ExitIntent, ManagedOrder, Quote, Side
 
 
 def test_journal_round_trip_and_private_permissions(tmp_path) -> None:
@@ -14,9 +14,18 @@ def test_journal_round_trip_and_private_permissions(tmp_path) -> None:
         Decimal("1.5"),
     )
 
-    journal.save([order], quote_deadline_at=1_800_000_000)
+    intent = ExitIntent(
+        "order-1:1.5",
+        "order-1",
+        "token-1",
+        Decimal("1.5"),
+        False,
+        1_700_000_001,
+    )
+    journal.save([order], quote_deadline_at=1_800_000_000, pending_exits=[intent])
     restored = journal.load()
 
     assert restored == [order]
     assert journal.load_quote_deadline() == 1_800_000_000
+    assert journal.load_pending_exits() == [intent]
     assert path.stat().st_mode & 0o777 == 0o600
