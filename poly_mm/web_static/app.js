@@ -7,15 +7,50 @@ const numberValue = (value) => {
   return Number.isFinite(parsed) ? parsed : 0;
 };
 
-function formatDuration(startedAt) {
-  if (!startedAt) return '—';
-  const seconds = Math.max(0, Math.floor(Date.now() / 1000 - Number(startedAt)));
-  if (!Number.isFinite(seconds)) return '—';
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  if (hours >= 24) return `${Math.floor(hours / 24)}天 ${hours % 24}时`;
-  if (hours) return `${hours}时 ${minutes}分`;
-  return `${minutes}分`;
+function formatCountdown(seconds) {
+  const remaining = Math.max(0, Math.floor(Number(seconds) || 0));
+  const days = Math.floor(remaining / 86400);
+  const hours = Math.floor((remaining % 86400) / 3600);
+  const minutes = Math.floor((remaining % 3600) / 60);
+  const secs = remaining % 60;
+  const clock = [hours, minutes, secs].map((value) => String(value).padStart(2, '0')).join(':');
+  return days ? `${days}天 ${clock}` : clock;
+}
+
+function formatConfiguredDuration(seconds) {
+  const totalMinutes = Math.max(0, Math.floor(Number(seconds) / 60));
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  return [days && `${days}天`, hours && `${hours}小时`, minutes && `${minutes}分钟`].filter(Boolean).join(' ') || '0分钟';
+}
+
+let latestStatus = null;
+
+function updateExpiryMetric(status = latestStatus) {
+  if (!status) return;
+  const configuredSeconds = Number(status.configuration?.run_duration_seconds || 0);
+  const quoteTask = status.quote_task || {};
+  const value = byId('expiry-countdown-value');
+  const note = byId('expiry-countdown-note');
+  if (configuredSeconds <= 0) {
+    value.textContent = '无限期';
+    note.textContent = '当前未设置任务有效期';
+    return;
+  }
+  if (quoteTask.expired) {
+    value.textContent = '已到期';
+    note.textContent = `本次有效期 ${formatConfiguredDuration(configuredSeconds)}`;
+    return;
+  }
+  if (!status.running || !quoteTask.deadline_at) {
+    value.textContent = '待启动';
+    note.textContent = `启动后倒计时 ${formatConfiguredDuration(configuredSeconds)}`;
+    return;
+  }
+  const remaining = Math.max(0, Number(quoteTask.deadline_at) - Date.now() / 1000);
+  value.textContent = formatCountdown(remaining);
+  note.textContent = status.paused ? '任务已暂停，倒计时继续' : `本次有效期 ${formatConfiguredDuration(configuredSeconds)}`;
 }
 
 function setTaskState(id, text, tone = '') {
@@ -203,6 +238,7 @@ function marketCell(label, detail = '') {
 }
 
 function render(status) {
+  latestStatus = status;
   const account = status.account || {};
   const configuration = status.configuration || {};
   const preflight = status.preflight;
@@ -220,22 +256,21 @@ function render(status) {
   byId('mode-badge').className = `mode-tag ${status.dry_run ? 'dry' : 'live'}`;
   byId('mode-badge').insertAdjacentHTML('afterbegin', '<span class="dot"></span>');
 
-  const totalPositionNotional = markets.reduce((total, market) => {
-    const bid = numberValue(market.book?.best_bid);
-    const ask = numberValue(market.book?.best_ask);
-    const mark = bid && ask ? (bid + ask) / 2 : bid || ask;
-    return total + Math.abs(numberValue(market.position)) * mark;
-  }, 0);
   const openNotional = orders.reduce((total, order) => {
     const remaining = Math.max(0, numberValue(order.size) - numberValue(order.filled_size));
     return total + numberValue(order.price) * remaining;
   }, 0);
   byId('open-order-value').textContent = String(orders.length);
   byId('open-order-note').textContent = orders.length ? '机器人正在管理开放订单' : '当前活跃挂单数量';
-  byId('total-position-value').textContent = totalPositionNotional.toFixed(2);
+  const walletBalance = Number(preflight?.collateral_balance);
+  byId('wallet-balance-value').textContent = Number.isFinite(walletBalance)
+    ? walletBalance.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 6 })
+    : '—';
+  byId('wallet-balance-note').textContent = Number.isFinite(walletBalance)
+    ? 'Polymarket 返回的 pUSD 余额'
+    : '预检或启动任务后更新';
   byId('open-notional-value').textContent = `$${openNotional.toFixed(2)}`;
-  byId('uptime-value').textContent = running ? formatDuration(status.started_at) : '—';
-  byId('uptime-note').textContent = running ? (status.paused ? '任务已暂停' : '机器人累计运行时长') : '机器人累计运行时长';
+  updateExpiryMetric(status);
   byId('open-orders-summary').textContent = orders.length ? `${orders.length} 笔开放订单` : '暂无挂单';
   byId('market-count').textContent = String(marketCount);
 
@@ -494,3 +529,4 @@ syncDurationControls();
 refresh();
 refreshLogs();
 window.setInterval(() => { refresh(); refreshLogs(); }, 2000);
+window.setInterval(() => { updateExpiryMetric(); }, 1000);

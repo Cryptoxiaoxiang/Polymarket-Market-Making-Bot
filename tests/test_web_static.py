@@ -54,6 +54,19 @@ def test_dashboard_uses_confirmed_modern_empty_state_without_market_module() -> 
     assert "@cryptoxiaoxiang" in html
 
 
+def test_dashboard_shows_wallet_balance_and_quote_expiry_countdown() -> None:
+    static_dir = Path(__file__).parents[1] / "poly_mm" / "web_static"
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    javascript = (static_dir / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="wallet-balance-value"' in html
+    assert 'id="expiry-countdown-value"' in html
+    assert 'id="total-position-value"' not in html
+    assert "preflight?.collateral_balance" in javascript
+    assert "updateExpiryMetric(status)" in javascript
+    assert "updateExpiryMetric(); }, 1000" in javascript
+
+
 def test_sidebar_uses_official_polymarket_icon_asset() -> None:
     static_dir = Path(__file__).parents[1] / "poly_mm" / "web_static"
     html = (static_dir / "index.html").read_text(encoding="utf-8")
