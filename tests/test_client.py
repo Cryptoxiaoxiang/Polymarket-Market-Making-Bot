@@ -50,3 +50,46 @@ def test_sell_limit_is_submitted_non_post_only_at_requested_price() -> None:
     assert call.kwargs["order_args"].size == 25.0
     assert call.kwargs["order_type"] == "GTC"
     assert call.kwargs["post_only"] is False
+
+
+def test_order_matched_shares_is_recovered_from_taker_and_maker_trades() -> None:
+    sdk = Mock()
+    sdk.get_trades.return_value = [
+        {
+            "id": "trade-1",
+            "status": "TRADE_STATUS_CONFIRMED",
+            "taker_order_id": "order-1",
+            "size": "1.5",
+            "maker_orders": [],
+        },
+        {
+            "id": "trade-2",
+            "status": "MATCHED",
+            "maker_orders": [
+                {"order_id": "order-1", "matched_amount": "2.5"},
+            ],
+        },
+        {
+            "id": "trade-2",
+            "status": "CONFIRMED",
+            "maker_orders": [
+                {"order_id": "order-1", "matched_amount": "2.5"},
+            ],
+        },
+        {
+            "id": "trade-3",
+            "status": "TRADE_STATUS_FAILED",
+            "taker_order_id": "order-1",
+            "size": "10",
+        },
+    ]
+    client = PolymarketClient(Settings(private_key="0x" + "1" * 64), dry_run=False)
+    client._sdk = sdk
+
+    matched = client.get_order_matched_shares("order-1", "token-1", 1_700_000_000)
+
+    assert matched == Decimal("4.0")
+    params = sdk.get_trades.call_args.args[0]
+    assert params.asset_id == "token-1"
+    assert params.after == 1_699_999_940
+    assert sdk.get_trades.call_args.kwargs["only_first_page"] is True

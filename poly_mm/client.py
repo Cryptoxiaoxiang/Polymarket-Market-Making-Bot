@@ -228,6 +228,41 @@ class PolymarketClient:
         params = OpenOrderParams(asset_id=token_id) if token_id else None
         return self._authenticated_sdk().get_open_orders(params)
 
+    def get_order_matched_shares(
+        self, order_id: str, token_id: str, created_at: float | None = None
+    ) -> Decimal:
+        """Recover an order's matched shares from authenticated trade history."""
+        if self.dry_run:
+            return Decimal()
+        from py_clob_client_v2 import TradeParams
+
+        after = max(0, int(created_at) - 60) if created_at is not None else None
+        trades = self._authenticated_sdk().get_trades(
+            TradeParams(asset_id=token_id, after=after), only_first_page=True
+        )
+        matched = Decimal()
+        seen_trade_ids: set[str] = set()
+        for trade in trades:
+            if not isinstance(trade, dict):
+                continue
+            status = str(trade.get("status") or "").upper()
+            if status.endswith("FAILED"):
+                continue
+            trade_id = str(trade.get("id") or "")
+            if trade_id and trade_id in seen_trade_ids:
+                continue
+            if trade_id:
+                seen_trade_ids.add(trade_id)
+            if str(trade.get("taker_order_id") or "") == order_id:
+                matched += Decimal(str(trade.get("size") or "0"))
+                continue
+            for maker_order in trade.get("maker_orders") or []:
+                if not isinstance(maker_order, dict):
+                    continue
+                if str(maker_order.get("order_id") or "") == order_id:
+                    matched += Decimal(str(maker_order.get("matched_amount") or "0"))
+        return matched
+
     def get_positions(self, condition_ids: list[str] | None = None) -> dict[str, Decimal]:
         if self.dry_run:
             return {}

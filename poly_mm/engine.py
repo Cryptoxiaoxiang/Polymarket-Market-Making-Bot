@@ -26,6 +26,7 @@ TERMINAL_ORDER_STATUSES = {
     "FAILED",
 }
 EXIT_LIMIT_PRICE = Decimal("0.01")
+MISSING_ORDER_CONFIRMATION_ATTEMPTS = 3
 
 
 class MarketMakerEngine:
@@ -41,6 +42,8 @@ class MarketMakerEngine:
         self.orders: dict[str, ManagedOrder] = {}
         self.pending_exits: dict[str, ExitIntent] = {}
         self.positions: dict[str, Decimal] = {}
+        self._position_baseline: dict[str, Decimal] = {}
+        self._positions_initialized = False
         self.halted_tokens: set[str] = set()
         self.stop = asyncio.Event()
         self._user_events: asyncio.Queue[dict] = asyncio.Queue()
@@ -48,6 +51,7 @@ class MarketMakerEngine:
         self._exit_tasks: set[asyncio.Task[None]] = set()
         self._exit_retry_base_seconds = 0.5
         self._next_position_poll_at = 0.0
+        self._missing_order_counts: dict[str, int] = {}
         self.paused = False
         self.phase = "created"
         self.started_at = time()
@@ -203,19 +207,61 @@ class MarketMakerEngine:
             return True
         condition_ids = [market.condition_id for market in self.config.enabled_markets]
         try:
-            self.positions = await asyncio.to_thread(self.client.get_positions, condition_ids)
+            refreshed = await asyncio.to_thread(self.client.get_positions, condition_ids)
         except Exception as error:
             logger.warning("Unable to refresh positions; pausing new quotes: %s", error)
             self._next_position_poll_at = now + 1
             return False
+        self.positions = refreshed
+        first_snapshot = not self._positions_initialized
+        if first_snapshot:
+            self._position_baseline = dict(refreshed)
+            self._positions_initialized = True
         self._next_position_poll_at = now + self.config.position_poll_interval_seconds
         if self.config.halt_on_fill:
             for market in self.config.enabled_markets:
                 size = self.positions.get(market.token_id, Decimal())
-                if size > 0 and market.token_id not in self.halted_tokens:
+                baseline = self._position_baseline.get(market.token_id, Decimal())
+                if first_snapshot:
+                    if size > 0 and market.token_id not in self.halted_tokens:
+                        self.halted_tokens.add(market.token_id)
+                        logger.warning(
+                            "Existing position %s detected for %s; token halted",
+                            size,
+                            market.label or market.token_id,
+                        )
+                        await self._cancel_token_orders(market.token_id)
+                    continue
+                if size < baseline:
+                    baseline = size
+                    self._position_baseline[market.token_id] = size
+                if size <= baseline or market.token_id in self.halted_tokens:
+                    continue
+                tracked_buy = next(
+                    (
+                        order
+                        for order in self.orders.values()
+                        if order.quote.token_id == market.token_id
+                        and order.quote.side == Side.BUY
+                    ),
+                    None,
+                )
+                if not first_snapshot and self.config.sell_on_fill and tracked_buy is not None:
+                    inferred_filled = min(tracked_buy.quote.size, size - baseline)
+                    if inferred_filled > tracked_buy.filled_size:
+                        tracked_buy.filled_size = inferred_filled
+                        self._persist_orders()
+                        logger.critical(
+                            "Position reconciliation attributed %s new shares to tracked BUY %s",
+                            inferred_filled,
+                            tracked_buy.order_id,
+                        )
+                        await self._handle_fill(tracked_buy, source="Position reconciliation")
+                        continue
+                if market.token_id not in self.halted_tokens:
                     self.halted_tokens.add(market.token_id)
                     logger.warning(
-                        "Existing position %s detected for %s; token halted",
+                        "Unattributed new position %s detected for %s; token halted",
                         size,
                         market.label or market.token_id,
                     )
@@ -239,17 +285,17 @@ class MarketMakerEngine:
                 except Exception:
                     continue
                 if order.order_id not in {_order_id(item) for item in open_orders}:
-                    logger.info(
-                        "Order %s is absent from open orders; removing stale journal entry",
-                        order.order_id,
-                    )
-                    self.orders.pop(order.order_id, None)
-                    changed = True
+                    changed = await self._reconcile_missing_order(order) or changed
                 continue
+            self._missing_order_counts.pop(order.order_id, None)
             filled = _matched_shares(state, order)
             if filled > order.filled_size:
                 order.filled_size = filled
                 changed = True
+            if (
+                order.quote.side == Side.BUY
+                and order.filled_size > order.exit_requested_size
+            ):
                 await self._handle_fill(order, source="REST")
             status = _normalise_status(state.get("status"))
             if status in TERMINAL_ORDER_STATUSES:
@@ -264,6 +310,58 @@ class MarketMakerEngine:
         if changed:
             self._persist_orders()
 
+    async def _reconcile_missing_order(self, order: ManagedOrder) -> bool:
+        """Confirm an absent order through trade history before forgetting it."""
+        try:
+            filled = await asyncio.to_thread(
+                self.client.get_order_matched_shares,
+                order.order_id,
+                order.quote.token_id,
+                order.created_at,
+            )
+        except Exception as error:
+            logger.warning(
+                "Unable to confirm trades for absent order %s; retaining it: %s",
+                order.order_id,
+                error,
+            )
+            return False
+        confirmed_filled = min(filled, order.quote.size)
+        if confirmed_filled > order.filled_size:
+            order.filled_size = confirmed_filled
+        if (
+            order.quote.side == Side.BUY
+            and confirmed_filled > order.exit_requested_size
+        ):
+            self._missing_order_counts.pop(order.order_id, None)
+            await self._handle_fill(order, source="REST trade reconciliation")
+            self.orders.pop(order.order_id, None)
+            logger.warning(
+                "Absent order %s matched %s shares according to trade history",
+                order.order_id,
+                order.filled_size,
+            )
+            return True
+
+        misses = self._missing_order_counts.get(order.order_id, 0) + 1
+        self._missing_order_counts[order.order_id] = misses
+        if misses < MISSING_ORDER_CONFIRMATION_ATTEMPTS:
+            logger.warning(
+                "Order %s is absent from open orders but has no visible trade yet; "
+                "retaining it for confirmation (%d/%d)",
+                order.order_id,
+                misses,
+                MISSING_ORDER_CONFIRMATION_ATTEMPTS,
+            )
+            return False
+        self._missing_order_counts.pop(order.order_id, None)
+        self.orders.pop(order.order_id, None)
+        logger.info(
+            "Order %s remained absent with no matching trade; removing stale journal entry",
+            order.order_id,
+        )
+        return True
+
     async def _cancel_stale(self) -> None:
         for order in list(self.orders.values()):
             # A protective fill exit must remain open until it fills or the
@@ -272,9 +370,7 @@ class MarketMakerEngine:
                 continue
             if order.age_seconds < self.config.cancel_after_seconds:
                 continue
-            if await self._cancel_order_reliably(order):
-                self.orders.pop(order.order_id, None)
-                self._persist_orders()
+            await self._cancel_token_buy_orders(order.quote.token_id)
 
     async def _cancel_order_reliably(self, order: ManagedOrder) -> bool:
         for attempt in range(self.config.cancel_retry_count):
@@ -318,7 +414,6 @@ class MarketMakerEngine:
                     await asyncio.to_thread(self.client.get_open_orders, market.token_id)
                 )
             if not remaining:
-                self.orders.clear()
                 self._persist_orders()
                 logger.info("Startup cancellation confirmed for all configured tokens")
                 return
@@ -375,24 +470,46 @@ class MarketMakerEngine:
             if order.quote.token_id != token_id or order.quote.side != Side.BUY:
                 continue
             if await self._cancel_order_reliably(order):
+                final_filled: Decimal | None = None
+                used_trade_fallback = False
                 try:
                     final_state = await asyncio.to_thread(
                         self.client.get_order, order.order_id
                     )
                     final_filled = _matched_shares(final_state, order)
-                    if final_filled > order.filled_size:
-                        order.filled_size = final_filled
-                        late_intent = self._queue_fill_exit(
-                            order, "REST post-cancellation reconciliation"
-                        )
-                        if late_intent is not None:
-                            self._schedule_exit(late_intent)
                 except Exception as error:
+                    used_trade_fallback = True
                     logger.warning(
-                        "Unable to read final fill amount for canceled order %s: %s",
+                        "Unable to read final order detail for canceled order %s: %s",
                         order.order_id,
                         error,
                     )
+                    try:
+                        final_filled = await asyncio.to_thread(
+                            self.client.get_order_matched_shares,
+                            order.order_id,
+                            order.quote.token_id,
+                            order.created_at,
+                        )
+                    except Exception as trade_error:
+                        logger.warning(
+                            "Unable to confirm trades for canceled order %s; retaining it: %s",
+                            order.order_id,
+                            trade_error,
+                        )
+                if final_filled is None:
+                    continue
+                if used_trade_fallback and final_filled <= order.filled_size:
+                    await self._reconcile_missing_order(order)
+                    continue
+                if final_filled > order.filled_size:
+                    order.filled_size = min(final_filled, order.quote.size)
+                    self.halted_tokens.add(order.quote.token_id)
+                    late_intent = self._queue_fill_exit(
+                        order, "REST post-cancellation reconciliation"
+                    )
+                    if late_intent is not None:
+                        self._schedule_exit(late_intent)
                 self.orders.pop(order.order_id, None)
                 self._persist_orders()
 

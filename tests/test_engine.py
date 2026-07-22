@@ -21,6 +21,8 @@ class FakeClient:
         self.cancelled: list[str] = []
         self.created: list[tuple[Quote, bool]] = []
         self.synced_tokens: list[str] = []
+        self.matched_shares = Decimal()
+        self.positions: dict[str, Decimal] = {}
 
     def get_order(self, order_id: str) -> dict:
         return self.order_state
@@ -29,8 +31,20 @@ class FakeClient:
         self.cancelled.append(order_id)
         self.open_orders = [row for row in self.open_orders if row["id"] != order_id]
 
+    def cancel_market_orders(self, condition_id: str, token_id: str) -> dict:
+        self.open_orders = []
+        return {}
+
     def get_open_orders(self, token_id: str | None = None) -> list[dict]:
         return list(self.open_orders)
+
+    def get_order_matched_shares(
+        self, order_id: str, token_id: str, created_at: float | None = None
+    ) -> Decimal:
+        return self.matched_shares
+
+    def get_positions(self, condition_ids: list[str] | None = None) -> dict[str, Decimal]:
+        return dict(self.positions)
 
     def sync_conditional_allowance(self, token_id: str) -> None:
         self.synced_tokens.append(token_id)
@@ -80,26 +94,90 @@ def test_unknown_rest_status_retains_order_for_safety(tmp_path) -> None:
     assert "order-1" in engine.orders
 
 
-def test_rest_error_removes_order_only_when_open_orders_confirms_absence(tmp_path) -> None:
+def test_rest_error_requires_repeated_trade_confirmation_before_removal(tmp_path) -> None:
     client = FakeClient(tmp_path / "orders.json")
     client.get_order = lambda order_id: (_ for _ in ()).throw(RuntimeError("not found"))
     engine = MarketMakerEngine(_config(), client)
     engine.orders = {"order-1": _order()}
 
     asyncio.run(engine._reconcile_orders())
+    asyncio.run(engine._reconcile_orders())
+
+    assert "order-1" in engine.orders
+
+    asyncio.run(engine._reconcile_orders())
 
     assert engine.orders == {}
 
 
-def test_empty_rest_state_removes_order_when_open_orders_confirms_absence(tmp_path) -> None:
+def test_empty_rest_state_requires_repeated_trade_confirmation_before_removal(tmp_path) -> None:
     client = FakeClient(tmp_path / "orders.json")
     client.order_state = None
     engine = MarketMakerEngine(_config(), client)
     engine.orders = {"order-1": _order()}
 
     asyncio.run(engine._reconcile_orders())
+    asyncio.run(engine._reconcile_orders())
+
+    assert "order-1" in engine.orders
+
+    asyncio.run(engine._reconcile_orders())
 
     assert engine.orders == {}
+
+
+def test_missing_order_uses_trade_history_to_submit_fill_exit(tmp_path) -> None:
+    client = FakeClient(tmp_path / "orders.json")
+    client.order_state = None
+    client.matched_shares = Decimal("2")
+    engine = MarketMakerEngine(
+        BotConfig(
+            sell_on_fill=True,
+            cancel_retry_base_seconds=0,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+    )
+    engine.orders = {"order-1": _order()}
+
+    async def scenario() -> None:
+        await engine._reconcile_orders()
+        await asyncio.gather(*engine._exit_tasks)
+
+    asyncio.run(scenario())
+
+    quote, post_only = client.created[0]
+    assert quote.side == Side.SELL
+    assert quote.price == Decimal("0.01")
+    assert quote.size == Decimal("2")
+    assert post_only is False
+    assert engine.pending_exits == {}
+
+
+def test_restored_unprotected_fill_uses_trade_history_to_submit_exit(tmp_path) -> None:
+    client = FakeClient(tmp_path / "orders.json")
+    client.order_state = None
+    client.matched_shares = Decimal("2")
+    engine = MarketMakerEngine(
+        BotConfig(
+            sell_on_fill=True,
+            cancel_retry_base_seconds=0,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+    )
+    order = _order()
+    order.filled_size = Decimal("2")
+    engine.orders = {order.order_id: order}
+
+    async def scenario() -> None:
+        await engine._reconcile_orders()
+        await asyncio.gather(*engine._exit_tasks)
+
+    asyncio.run(scenario())
+
+    assert client.created[0][0].size == Decimal("2")
+    assert order.exit_requested_size == Decimal("2")
 
 
 def test_rest_fixed_math_fill_is_converted_to_shares(tmp_path) -> None:
@@ -212,6 +290,67 @@ def test_fill_exit_retries_until_shares_are_available(tmp_path) -> None:
     assert client.attempts == 2
     assert client.created[0][0].size == Decimal("2")
     assert engine.pending_exits == {}
+
+
+def test_position_increase_for_tracked_buy_submits_fill_exit(tmp_path) -> None:
+    client = FakeClient(tmp_path / "orders.json")
+    engine = MarketMakerEngine(
+        BotConfig(
+            sell_on_fill=True,
+            cancel_retry_base_seconds=0,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+    )
+
+    async def scenario() -> None:
+        await engine._refresh_positions_if_due()
+        order = _order()
+        engine.orders = {order.order_id: order}
+        client.open_orders = [{"id": order.order_id}]
+        client.positions = {"token-1": Decimal("5")}
+        engine._next_position_poll_at = 0
+        await engine._refresh_positions_if_due()
+        await asyncio.gather(*engine._exit_tasks)
+
+    asyncio.run(scenario())
+
+    quote, post_only = client.created[0]
+    assert quote.side == Side.SELL
+    assert quote.price == Decimal("0.01")
+    assert quote.size == Decimal("5")
+    assert post_only is False
+    assert "token-1" in engine.halted_tokens
+
+
+def test_position_existing_before_start_is_halted_but_not_sold(tmp_path) -> None:
+    client = FakeClient(tmp_path / "orders.json")
+    client.positions = {"token-1": Decimal("5")}
+    engine = MarketMakerEngine(
+        BotConfig(
+            sell_on_fill=True,
+            cancel_retry_base_seconds=0,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+    )
+
+    asyncio.run(engine._refresh_positions_if_due())
+
+    assert client.created == []
+    assert "token-1" in engine.halted_tokens
+
+
+def test_startup_cancellation_keeps_restored_orders_for_fill_reconciliation(
+    tmp_path,
+) -> None:
+    client = FakeClient(tmp_path / "orders.json")
+    engine = MarketMakerEngine(_config(), client)
+    engine.orders = {"order-1": _order()}
+
+    asyncio.run(engine._cancel_configured_orders_on_start())
+
+    assert "order-1" in engine.orders
 
 
 def test_post_cancel_reconciliation_exits_late_partial_fill(tmp_path) -> None:

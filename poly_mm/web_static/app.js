@@ -456,7 +456,7 @@ document.addEventListener('pointerdown', (event) => {
   requestAnimationFrame(updateLogRefreshPauseState);
 });
 document.addEventListener('selectionchange', updateLogRefreshPauseState);
-byId('start-button').addEventListener('click', (event) => action('/api/start', { confirmText: '确认启动挂单任务？实盘预检通过后会提交真实订单。', trigger: event.currentTarget }));
+byId('start-button').addEventListener('click', (event) => action('/api/start', { trigger: event.currentTarget }));
 byId('stop-button').addEventListener('click', (event) => action('/api/stop', { trigger: event.currentTarget }));
 byId('pause-button').addEventListener('click', (event) => action('/api/pause', { trigger: event.currentTarget }));
 byId('resume-button').addEventListener('click', (event) => action('/api/resume', { trigger: event.currentTarget }));
