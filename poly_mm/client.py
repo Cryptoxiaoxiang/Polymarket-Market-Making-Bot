@@ -99,18 +99,18 @@ class PolymarketClient:
         if not allowances:
             raise RuntimeError("CLOB returned no collateral allowance values")
         minimum_allowance = min(allowances)
-        # Outcome-token prices cannot exceed 1 pUSD, so one maximum-sized order
-        # needs at most max_order_size pUSD. The total-open-shares limit is not a
-        # currency amount and must not be compared directly with collateral.
-        required = config.risk.max_order_size
+        required, planned_shares = self.planned_buy_collateral(config)
         if balance < required:
             raise RuntimeError(
                 "Insufficient pUSD balance: "
-                f"{balance} available, {required} required for one maximum-sized order"
+                f"{balance} available, {required} required for the current planned "
+                f"BUY orders ({planned_shares} shares at current quote prices)"
             )
         if minimum_allowance < required:
             raise RuntimeError(
-                f"Insufficient CLOB allowance: minimum {minimum_allowance}, {required} required"
+                "Insufficient CLOB allowance: "
+                f"minimum {minimum_allowance}, {required} required for the current "
+                "planned BUY orders"
             )
 
         # Confirm L2 credentials can read account state before the engine can submit.
@@ -123,6 +123,21 @@ class PolymarketClient:
             country=country,
             region=str(geo.get("region") or ""),
         )
+
+    def planned_buy_collateral(self, config: BotConfig) -> tuple[Decimal, Decimal]:
+        """Return current pUSD notional and shares for quotes the engine would place."""
+        from poly_mm.strategy import PassiveMakerStrategy
+
+        strategy = PassiveMakerStrategy(config.strategy)
+        required = Decimal()
+        shares = Decimal()
+        for market in config.enabled_markets:
+            quote = strategy.build_quote(market, self.get_orderbook(market.token_id))
+            if quote is None:
+                continue
+            required += quote.price * quote.size
+            shares += quote.size
+        return required, shares
 
     def get_orderbook(self, token_id: str) -> OrderBook:
         response = requests.get(f"{self.settings.host}/book", params={"token_id": token_id}, timeout=10)

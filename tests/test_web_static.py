@@ -61,3 +61,11 @@ def test_sidebar_uses_official_polymarket_icon_asset() -> None:
     assert 'src="/static/polymarket-icon-white.png"' in html
     assert (static_dir / "polymarket-icon-white.png").is_file()
     assert '<div class="brand-logo">P</div>' not in html
+
+
+def test_account_setup_explains_proxy_funder_address() -> None:
+    static_dir = Path(__file__).parents[1] / "poly_mm" / "web_static"
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
+
+    assert "只有资金直接位于 EOA 地址时才选 0" in html
+    assert "Polymarket 右上角地址与私钥 EOA 地址不同" in html

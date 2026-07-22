@@ -5,6 +5,7 @@ import pytest
 
 from poly_mm.client import PolymarketClient
 from poly_mm.config import BotConfig, MarketConfig, RiskConfig, Settings
+from poly_mm.models import Level, OrderBook
 
 
 def _live_config(required: str = "100") -> BotConfig:
@@ -29,6 +30,9 @@ def test_eoa_preflight_checks_balance_allowances_and_l2() -> None:
     client.signer_address = Mock(return_value="0xAbC")
     client.check_geoblock = Mock(
         return_value={"blocked": False, "country": "CA", "region": "BC"}
+    )
+    client.planned_buy_collateral = Mock(
+        return_value=(Decimal("49"), Decimal("100"))
     )
     client._authenticated_sdk = Mock(return_value=sdk)
 
@@ -82,6 +86,9 @@ def test_preflight_allows_japan_frontend_only_restriction() -> None:
     client.check_geoblock = Mock(
         return_value={"blocked": True, "country": "JP", "region": "13"}
     )
+    client.planned_buy_collateral = Mock(
+        return_value=(Decimal("49"), Decimal("100"))
+    )
     client._authenticated_sdk = Mock(return_value=sdk)
 
     report = client.run_preflight(_live_config())
@@ -103,7 +110,32 @@ def test_preflight_rejects_insufficient_allowance() -> None:
     )
     client.signer_address = Mock(return_value="0xabc")
     client.check_geoblock = Mock(return_value={"blocked": False})
+    client.planned_buy_collateral = Mock(
+        return_value=(Decimal("100"), Decimal("100"))
+    )
     client._authenticated_sdk = Mock(return_value=sdk)
 
     with pytest.raises(RuntimeError, match="Insufficient CLOB allowance"):
         client.run_preflight(_live_config())
+
+
+def test_preflight_prices_share_quantity_as_current_quote_notional() -> None:
+    client = PolymarketClient(Settings(), dry_run=False)
+    client.get_orderbook = Mock(
+        return_value=OrderBook(
+            "token-1",
+            bids=[Level(Decimal("0.50"), Decimal("200"))],
+            asks=[Level(Decimal("0.54"), Decimal("200"))],
+            tick_size=Decimal("0.01"),
+            min_order_size=Decimal("5"),
+        )
+    )
+    config = BotConfig(
+        dry_run=False,
+        markets=[MarketConfig(token_id="token-1", quote_size=Decimal("100"))],
+    )
+
+    required, shares = client.planned_buy_collateral(config)
+
+    assert shares == Decimal("100")
+    assert required == Decimal("49")

@@ -145,11 +145,13 @@ ssh -N -L 8081:127.0.0.1:8081 your-user@your-vps
 实盘预检结果，并提供：
 
 - 在网页中保存 Private Key、钱包签名类型和 funder 地址；普通独立 EOA 选择类型
-  `0` 并让 funder 留空；
+  `0` 并让 funder 留空；如果 Polymarket 右上角显示的资金地址与该 EOA 不同，必须
+  改用对应的 Proxy、Safe 或 Deposit Wallet 类型，并把网页显示的完整地址作为 funder；
 - 保存时在 VPS 内存中校验私钥，并通过官方 SDK `create_or_derive_api_key()` 自动派生
   L2 API key、secret 和 passphrase；页面和状态 API 只返回“是否已配置”，从不回显
   私钥或 L2 secret；
 - 单独运行不会下单的实盘预检；
+  余额要求按每个当前计划 BUY 的“挂单份数 × 当前报价”求和，不把份数直接当作美元；
 - 明确启动或停止挂单任务；网页服务本身重启后不会自动恢复实盘任务；
 - 默认不设置有效期；在“挂单设置”中勾选后，可通过“小时”和“分钟”下拉框设置
   1 分钟至 7 天的挂单任务有效期，每次启动时重新倒计时；
