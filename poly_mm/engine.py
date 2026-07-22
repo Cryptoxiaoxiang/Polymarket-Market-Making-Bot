@@ -49,7 +49,7 @@ class MarketMakerEngine:
         self._user_events: asyncio.Queue[dict] = asyncio.Queue()
         self._websocket_task: asyncio.Task[None] | None = None
         self._exit_tasks: set[asyncio.Task[None]] = set()
-        self._exit_retry_base_seconds = 0.5
+        self._exit_retry_base_seconds = 0.1
         self._next_position_poll_at = 0.0
         self._missing_order_counts: dict[str, int] = {}
         self.paused = False
@@ -194,7 +194,9 @@ class MarketMakerEngine:
                 }
                 quote = self.strategy.build_quote(market, book)
                 if quote and self.risk.approve(quote, active, self.positions):
-                    order = await asyncio.to_thread(self.client.create_order, quote)
+                    order = await asyncio.to_thread(
+                        self.client.create_order, quote, tick_size=book.tick_size
+                    )
                     self.orders[order.order_id] = order
                     self._persist_orders()
                     active.append(order)
@@ -451,6 +453,10 @@ class MarketMakerEngine:
         if order.quote.side != Side.BUY:
             return
         intent = self._queue_fill_exit(order, source)
+        if intent is not None:
+            # Do not put cancellation round trips on the protective SELL's
+            # critical path. The task starts as soon as cancellation yields.
+            self._schedule_exit(intent)
         if self.config.halt_on_fill:
             first_halt = order.quote.token_id not in self.halted_tokens
             self.halted_tokens.add(order.quote.token_id)
@@ -462,8 +468,6 @@ class MarketMakerEngine:
                     order.filled_size,
                 )
             await self._cancel_token_buy_orders(order.quote.token_id)
-        if intent is not None:
-            self._schedule_exit(intent)
 
     async def _cancel_token_buy_orders(self, token_id: str) -> None:
         for order in list(self.orders.values()):
@@ -560,6 +564,9 @@ class MarketMakerEngine:
 
     async def _submit_fill_exit(self, intent: ExitIntent) -> None:
         attempt = 0
+        cached_book = self.latest_books.get(intent.token_id, {})
+        cached_tick = cached_book.get("tick_size")
+        tick_size = Decimal(str(cached_tick)) if cached_tick else None
         while not self.stop.is_set() and intent.intent_id in self.pending_exits:
             attempt += 1
             quote = Quote(
@@ -570,23 +577,39 @@ class MarketMakerEngine:
                 neg_risk=intent.neg_risk,
             )
             try:
-                await asyncio.to_thread(
-                    self.client.sync_conditional_allowance, intent.token_id
-                )
                 exit_order = await asyncio.to_thread(
-                    self.client.create_order, quote, post_only=False
+                    self.client.create_order,
+                    quote,
+                    post_only=False,
+                    tick_size=tick_size,
                 )
             except asyncio.CancelledError:
                 raise
             except Exception as error:
+                error_text = str(error).casefold()
+                if "tick" in error_text:
+                    tick_size = None
+                if "balance" in error_text or "allowance" in error_text:
+                    try:
+                        await asyncio.to_thread(
+                            self.client.sync_conditional_allowance, intent.token_id
+                        )
+                    except Exception as sync_error:
+                        logger.warning(
+                            "Conditional balance refresh failed for %s: %s",
+                            intent.token_id,
+                            sync_error,
+                        )
                 delay = min(
-                    self._exit_retry_base_seconds * (2 ** min(attempt - 1, 3)),
-                    5.0,
+                    self._exit_retry_base_seconds * (2 ** min(attempt - 1, 4)),
+                    1.6,
                 )
                 logger.critical(
-                    "$0.01 SELL attempt %d failed for %s; retrying in %.1fs: %s",
+                    "$0.01 SELL attempt %d failed for %s after %.0fms; "
+                    "retrying in %.1fs: %s",
                     attempt,
                     intent.token_id,
+                    (time() - intent.created_at) * 1000,
                     delay,
                     error,
                 )
@@ -597,10 +620,13 @@ class MarketMakerEngine:
             self.pending_exits.pop(intent.intent_id, None)
             self._persist_orders()
             logger.critical(
-                "$0.01 SELL submitted for %s shares on %s: %s",
+                "$0.01 SELL submitted for %s shares on %s: %s "
+                "(fill-to-submit %.0fms, attempts=%d)",
                 intent.size,
                 intent.token_id,
                 exit_order.order_id,
+                (time() - intent.created_at) * 1000,
+                attempt,
             )
             return
 

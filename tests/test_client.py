@@ -52,6 +52,24 @@ def test_sell_limit_is_submitted_non_post_only_at_requested_price() -> None:
     assert call.kwargs["post_only"] is False
 
 
+def test_cached_tick_size_skips_orderbook_request() -> None:
+    sdk = Mock()
+    sdk.create_and_post_order.return_value = {"success": True, "orderID": "sell-1"}
+    client = PolymarketClient(Settings(private_key="0x" + "1" * 64), dry_run=False)
+    client._sdk = sdk
+    client.get_orderbook = Mock(side_effect=AssertionError("unexpected orderbook request"))
+    quote = Quote("token-1", Side.SELL, Decimal("0.01"), Decimal("25"))
+
+    order = client.create_order(
+        quote, post_only=False, tick_size=Decimal("0.01")
+    )
+
+    assert order.order_id == "sell-1"
+    options = sdk.create_and_post_order.call_args.kwargs["options"]
+    assert options.tick_size == "0.01"
+    client.get_orderbook.assert_not_called()
+
+
 def test_order_matched_shares_is_recovered_from_taker_and_maker_trades() -> None:
     sdk = Mock()
     sdk.get_trades.return_value = [

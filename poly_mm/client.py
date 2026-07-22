@@ -137,7 +137,13 @@ class PolymarketClient:
             neg_risk=bool(data.get("neg_risk", False)),
         )
 
-    def create_order(self, quote: Quote, *, post_only: bool = True) -> ManagedOrder:
+    def create_order(
+        self,
+        quote: Quote,
+        *,
+        post_only: bool = True,
+        tick_size: Decimal | None = None,
+    ) -> ManagedOrder:
         if self.dry_run:
             order = ManagedOrder(f"dry-{uuid4().hex[:12]}", quote, time())
             self._dry_orders[order.order_id] = order
@@ -153,7 +159,7 @@ class PolymarketClient:
         sdk = self._authenticated_sdk()
         from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions
         from py_clob_client_v2.order_builder.constants import BUY, SELL
-        book = self.get_orderbook(quote.token_id)
+        resolved_tick_size = tick_size or self.get_orderbook(quote.token_id).tick_size
         result = sdk.create_and_post_order(
             order_args=OrderArgs(
                 token_id=quote.token_id,
@@ -162,7 +168,7 @@ class PolymarketClient:
                 side=BUY if quote.side == Side.BUY else SELL,
             ),
             options=PartialCreateOrderOptions(
-                tick_size=str(book.tick_size), neg_risk=quote.neg_risk
+                tick_size=str(resolved_tick_size), neg_risk=quote.neg_risk
             ),
             order_type=OrderType.GTC,
             post_only=post_only,

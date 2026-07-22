@@ -1,5 +1,6 @@
 import asyncio
 from decimal import Decimal
+from threading import Event
 from time import time
 from types import SimpleNamespace
 
@@ -49,7 +50,13 @@ class FakeClient:
     def sync_conditional_allowance(self, token_id: str) -> None:
         self.synced_tokens.append(token_id)
 
-    def create_order(self, quote: Quote, *, post_only: bool = True) -> ManagedOrder:
+    def create_order(
+        self,
+        quote: Quote,
+        *,
+        post_only: bool = True,
+        tick_size: Decimal | None = None,
+    ) -> ManagedOrder:
         self.created.append((quote, post_only))
         return ManagedOrder("exit-order", quote, time())
 
@@ -244,7 +251,7 @@ def test_buy_fill_submits_same_size_sell_at_one_cent(tmp_path) -> None:
     asyncio.run(scenario())
 
     assert client.cancelled == ["order-1"]
-    assert client.synced_tokens == ["token-1"]
+    assert client.synced_tokens == []
     quote, post_only = client.created[0]
     assert quote.side == Side.SELL
     assert quote.price == Decimal("0.01")
@@ -254,17 +261,72 @@ def test_buy_fill_submits_same_size_sell_at_one_cent(tmp_path) -> None:
     assert engine.orders["exit-order"].quote.side == Side.SELL
 
 
+def test_fill_exit_starts_before_buy_cancellation_finishes(tmp_path) -> None:
+    class SlowCancelClient(FakeClient):
+        def __init__(self, journal_path) -> None:
+            super().__init__(journal_path)
+            self.sell_started = Event()
+            self.sell_started_before_cancel_finished = False
+
+        def cancel_order(self, order_id: str) -> None:
+            self.sell_started_before_cancel_finished = self.sell_started.wait(1)
+            super().cancel_order(order_id)
+
+        def create_order(
+            self,
+            quote: Quote,
+            *,
+            post_only: bool = True,
+            tick_size: Decimal | None = None,
+        ) -> ManagedOrder:
+            if quote.side == Side.SELL:
+                self.sell_started.set()
+            return super().create_order(
+                quote, post_only=post_only, tick_size=tick_size
+            )
+
+    client = SlowCancelClient(tmp_path / "orders.json")
+    client.open_orders = [{"id": "order-1"}]
+    engine = MarketMakerEngine(
+        BotConfig(
+            sell_on_fill=True,
+            cancel_retry_base_seconds=0,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+    )
+    order = _order()
+    order.filled_size = Decimal("1")
+    engine.orders = {order.order_id: order}
+
+    async def scenario() -> None:
+        await engine._handle_fill(order, source="WebSocket")
+        await asyncio.gather(*engine._exit_tasks)
+
+    asyncio.run(scenario())
+
+    assert client.sell_started_before_cancel_finished is True
+
+
 def test_fill_exit_retries_until_shares_are_available(tmp_path) -> None:
     class DelayedSharesClient(FakeClient):
         def __init__(self, journal_path) -> None:
             super().__init__(journal_path)
             self.attempts = 0
 
-        def create_order(self, quote: Quote, *, post_only: bool = True) -> ManagedOrder:
+        def create_order(
+            self,
+            quote: Quote,
+            *,
+            post_only: bool = True,
+            tick_size: Decimal | None = None,
+        ) -> ManagedOrder:
             self.attempts += 1
             if self.attempts == 1:
                 raise RuntimeError("not enough balance / allowance")
-            return super().create_order(quote, post_only=post_only)
+            return super().create_order(
+                quote, post_only=post_only, tick_size=tick_size
+            )
 
     client = DelayedSharesClient(tmp_path / "orders.json")
     client.open_orders = [{"id": "order-1"}]
@@ -288,6 +350,7 @@ def test_fill_exit_retries_until_shares_are_available(tmp_path) -> None:
     asyncio.run(scenario())
 
     assert client.attempts == 2
+    assert client.synced_tokens == ["token-1"]
     assert client.created[0][0].size == Decimal("2")
     assert engine.pending_exits == {}
 
