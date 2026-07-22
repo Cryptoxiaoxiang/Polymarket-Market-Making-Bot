@@ -32,6 +32,7 @@ const runDurationHours = setupForm.elements.namedItem('run_duration_hours');
 const runDurationMinutes = setupForm.elements.namedItem('run_duration_minutes');
 let setupFormDirty = false;
 let accountFormDirty = false;
+let actionInFlight = false;
 const logPanels = [...document.querySelectorAll('.log-preview, .full-log')];
 const logRefreshStatus = byId('log-refresh-status');
 const logRefreshStatusText = byId('log-refresh-status-text');
@@ -370,9 +371,11 @@ async function refreshLogs({ force = false } = {}) {
   }
 }
 
-async function action(path, { body, confirmText } = {}) {
+async function action(path, { body, confirmText, trigger } = {}) {
   if (confirmText && !window.confirm(confirmText)) return false;
-  document.querySelectorAll('button').forEach((button) => { button.disabled = true; });
+  if (actionInFlight) return false;
+  actionInFlight = true;
+  if (trigger) trigger.disabled = true;
   try {
     const headers = { 'X-Requested-With': 'poly-mm-console' };
     if (body) headers['Content-Type'] = 'application/json';
@@ -386,6 +389,8 @@ async function action(path, { body, confirmText } = {}) {
     showNotice(error.message, true);
     return false;
   } finally {
+    actionInFlight = false;
+    if (trigger) trigger.disabled = false;
     await refresh();
   }
 }
@@ -415,11 +420,11 @@ document.addEventListener('pointerdown', (event) => {
   requestAnimationFrame(updateLogRefreshPauseState);
 });
 document.addEventListener('selectionchange', updateLogRefreshPauseState);
-byId('start-button').addEventListener('click', () => action('/api/start', { confirmText: '确认启动挂单任务？实盘预检通过后会提交真实订单。' }));
-byId('stop-button').addEventListener('click', () => action('/api/stop'));
-byId('pause-button').addEventListener('click', () => action('/api/pause'));
-byId('resume-button').addEventListener('click', () => action('/api/resume'));
-byId('run-preflight').addEventListener('click', () => action('/api/preflight'));
+byId('start-button').addEventListener('click', (event) => action('/api/start', { confirmText: '确认启动挂单任务？实盘预检通过后会提交真实订单。', trigger: event.currentTarget }));
+byId('stop-button').addEventListener('click', (event) => action('/api/stop', { trigger: event.currentTarget }));
+byId('pause-button').addEventListener('click', (event) => action('/api/pause', { trigger: event.currentTarget }));
+byId('resume-button').addEventListener('click', (event) => action('/api/resume', { trigger: event.currentTarget }));
+byId('run-preflight').addEventListener('click', (event) => action('/api/preflight', { trigger: event.currentTarget }));
 byId('refresh-logs').addEventListener('click', () => refreshLogs({ force: true }));
 byId('dashboard-add-market').addEventListener('click', () => {
   showView('tasks');
@@ -434,7 +439,7 @@ byId('account-form').addEventListener('submit', async (event) => {
     private_key: byId('private-key').value,
     signature_type: Number(byId('signature-type').value),
     funder_address: byId('funder-address').value,
-  } });
+  }, trigger: event.submitter });
   byId('private-key').value = '';
   if (saved) accountFormDirty = false;
 });
@@ -467,10 +472,10 @@ setupForm.addEventListener('submit', async (event) => {
     run_duration_hours: Number(runDurationHours.value),
     run_duration_minutes: Number(runDurationMinutes.value),
     dry_run: setupForm.elements.namedItem('dry_run').checked,
-  } });
+  }, trigger: event.submitter });
   if (saved) setupFormDirty = false;
 });
-byId('clear-setup').addEventListener('click', async () => {
+byId('clear-setup').addEventListener('click', async (event) => {
   if (!window.confirm('确认清空全部挂单市场？机器人将保持停止，且不会创建订单。')) return;
   const saved = await action('/api/setup', { body: {
     markets: [],
@@ -481,7 +486,7 @@ byId('clear-setup').addEventListener('click', async () => {
     run_duration_hours: 0,
     run_duration_minutes: 0,
     dry_run: setupForm.elements.namedItem('dry_run').checked,
-  } });
+  }, trigger: event.currentTarget });
   if (saved) setupFormDirty = false;
 });
 

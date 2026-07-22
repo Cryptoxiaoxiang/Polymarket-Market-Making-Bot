@@ -30,6 +30,15 @@ def test_quote_settings_replace_misleading_read_only_summary() -> None:
     assert "action('/api/setup'" in javascript
 
 
+def test_web_actions_only_disable_the_button_that_triggered_them() -> None:
+    static_dir = Path(__file__).parents[1] / "poly_mm" / "web_static"
+    javascript = (static_dir / "app.js").read_text(encoding="utf-8")
+
+    assert "document.querySelectorAll('button').forEach((button) => { button.disabled = true; });" not in javascript
+    assert "if (trigger) trigger.disabled = true;" in javascript
+    assert "if (trigger) trigger.disabled = false;" in javascript
+
+
 def test_dashboard_uses_confirmed_modern_empty_state_without_market_module() -> None:
     static_dir = Path(__file__).parents[1] / "poly_mm" / "web_static"
     html = (static_dir / "index.html").read_text(encoding="utf-8")
