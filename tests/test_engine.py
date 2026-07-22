@@ -81,6 +81,17 @@ def test_rest_error_removes_order_only_when_open_orders_confirms_absence(tmp_pat
     assert engine.orders == {}
 
 
+def test_empty_rest_state_removes_order_when_open_orders_confirms_absence(tmp_path) -> None:
+    client = FakeClient(tmp_path / "orders.json")
+    client.order_state = None
+    engine = MarketMakerEngine(_config(), client)
+    engine.orders = {"order-1": _order()}
+
+    asyncio.run(engine._reconcile_orders())
+
+    assert engine.orders == {}
+
+
 def test_rest_fixed_math_fill_is_converted_to_shares(tmp_path) -> None:
     client = FakeClient(
         tmp_path / "orders.json",

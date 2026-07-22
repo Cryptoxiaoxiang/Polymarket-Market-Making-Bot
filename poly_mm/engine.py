@@ -209,6 +209,8 @@ class MarketMakerEngine:
         for order in list(self.orders.values()):
             try:
                 state = await asyncio.to_thread(self.client.get_order, order.order_id)
+                if not isinstance(state, dict):
+                    raise RuntimeError("CLOB returned no order detail")
             except Exception as error:
                 logger.warning("Unable to reconcile order %s: %s", order.order_id, error)
                 try:
