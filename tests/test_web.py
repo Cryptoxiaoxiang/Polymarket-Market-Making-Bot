@@ -4,6 +4,27 @@ import os
 from poly_mm.web import ACCOUNT_ENV_KEYS, DashboardController
 
 
+def test_web_controller_supports_zero_markets_but_refuses_task_start(tmp_path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("dry_run = true\n", encoding="utf-8")
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    controller = DashboardController(config_path, env_path)
+
+    async def scenario() -> None:
+        status = await controller.snapshot()
+        assert status["markets"] == []
+        assert status["configuration"]["market_count"] == 0
+        try:
+            await controller.start_bot()
+        except ValueError as error:
+            assert "添加至少一个启用的市场" in str(error)
+        else:
+            raise AssertionError("expected task start without markets to fail")
+
+    asyncio.run(scenario())
+
+
 def test_web_account_save_derives_credentials_without_returning_secrets(
     tmp_path, monkeypatch
 ) -> None:

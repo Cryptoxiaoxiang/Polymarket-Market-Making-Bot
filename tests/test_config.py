@@ -4,11 +4,22 @@ from poly_mm.config import load_config, update_dotenv_values
 
 
 def test_example_config_defaults_to_live_trading() -> None:
-    config = load_config("config.example.toml")
+    config = load_config("config.example.toml", require_markets=False)
 
     assert config.dry_run is False
     assert config.preflight_enabled is True
     assert str(config.risk.max_total_open_notional) == "5"
+    assert config.markets == []
+
+
+def test_trading_config_requires_an_enabled_market(tmp_path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text("dry_run = true\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="At least one enabled market"):
+        load_config(path)
+
+    assert load_config(path, require_markets=False).markets == []
 
 
 def test_console_rejects_non_loopback_bind(tmp_path) -> None:

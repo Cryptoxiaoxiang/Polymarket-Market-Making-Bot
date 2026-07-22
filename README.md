@@ -5,10 +5,9 @@
 挂 **post-only BUY** 单：读取真实盘口，在最优买价后留出若干 tick，定时撤单重挂，
 并限制挂单数、订单大小、已有持仓和总挂单名义金额。
 
-项目已预配置以下市场的 `Yes` outcome，启动时通过官方 Gamma API 动态解析 token，
-不会把可能变化的 token 信息硬编码进策略：
-
-<https://polymarket.com/event/clarity-act-signed-into-law-in-2026>
+项目不预置任何市场。网页控制器可以在零市场状态下运行；启动挂单任务前，需要在
+`config.toml` 中添加至少一个 `[[markets]]`，程序随后通过官方 Gamma API 动态解析
+token，不会把可能变化的 token 信息硬编码进策略。
 
 默认 `dry_run = false`。systemd 启动的是常驻网页控制器，不会自动启动挂单任务；用户
 需要在页面中明确点击“启动挂单任务”，随后程序才会执行实盘预检，并在通过后签名和

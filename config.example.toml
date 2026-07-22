@@ -19,14 +19,8 @@ console_enabled = true
 console_host = "127.0.0.1"
 console_port = 8081
 
-[[markets]]
-# Paste a Polymarket event/market URL and select an outcome. The bot resolves
-# the outcome token ID from the official Gamma API at startup.
-url = "https://polymarket.com/event/clarity-act-signed-into-law-in-2026"
-outcome = "Yes"
-label = "Clarity Act signed into law in 2026 — Yes"
-enabled = true
-quote_size = "5"
+# No market is preconfigured. Add one or more [[markets]] blocks before
+# starting a quoting task; the web controller can run with zero markets.
 
 [strategy]
 # Quote one tick behind the best bid by default. Set join_best_price=true to join it.

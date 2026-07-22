@@ -93,7 +93,7 @@ class BotConfig:
         return [market for market in self.markets if market.enabled]
 
 
-def load_config(path: str | Path) -> BotConfig:
+def load_config(path: str | Path, *, require_markets: bool = True) -> BotConfig:
     with Path(path).open("rb") as handle:
         data = tomllib.load(handle)
     strategy_raw, risk_raw = data.get("strategy", {}), data.get("risk", {})
@@ -130,7 +130,7 @@ def load_config(path: str | Path) -> BotConfig:
         risk=risk,
         markets=markets,
     )
-    if not config.enabled_markets:
+    if require_markets and not config.enabled_markets:
         raise ValueError("At least one enabled market is required")
     for market in config.enabled_markets:
         if not market.token_id and not market.url:

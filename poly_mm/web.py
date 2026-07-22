@@ -82,7 +82,7 @@ class DashboardController:
         }
 
     async def snapshot(self) -> dict[str, Any]:
-        config = load_config(self.config_path)
+        config = load_config(self.config_path, require_markets=False)
         if self.engine is not None:
             status = await self.engine.snapshot()
         else:
@@ -110,6 +110,8 @@ class DashboardController:
             if self.running:
                 raise ValueError("挂单任务已经在运行。")
             config = await self._resolved_config()
+            if not config.enabled_markets:
+                raise ValueError("请先在 config.toml 中添加至少一个启用的市场。")
             settings = self.settings()
             if not config.dry_run and not settings.private_key:
                 raise ValueError("请先在账户设置中保存钱包私钥。")
@@ -235,7 +237,7 @@ class DashboardController:
         }
 
     async def _resolved_config(self) -> BotConfig:
-        config = load_config(self.config_path)
+        config = load_config(self.config_path, require_markets=False)
         resolved_markets = []
         for market in config.markets:
             resolved = await asyncio.to_thread(resolve_market, market) if market.enabled else market
@@ -298,7 +300,7 @@ def _preflight_dict(report: PreflightReport) -> dict[str, str]:
 
 async def async_main() -> None:
     args = parse_args()
-    config = load_config(args.config)
+    config = load_config(args.config, require_markets=False)
     controller = DashboardController(args.config, args.env)
     console = ConsoleServer(
         controller,
