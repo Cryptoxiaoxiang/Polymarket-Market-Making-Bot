@@ -67,6 +67,30 @@ def test_preflight_rejects_blocked_vps_before_authentication() -> None:
     client._authenticated_sdk.assert_not_called()
 
 
+def test_preflight_allows_japan_frontend_only_restriction() -> None:
+    sdk = Mock()
+    sdk.get_balance_allowance.return_value = {
+        "balance": "250000000",
+        "allowances": {"exchange": "150000000"},
+    }
+    sdk.get_open_orders.return_value = []
+    client = PolymarketClient(
+        Settings(private_key="not-used", funder="0xabc", signature_type=0),
+        dry_run=False,
+    )
+    client.signer_address = Mock(return_value="0xabc")
+    client.check_geoblock = Mock(
+        return_value={"blocked": True, "country": "JP", "region": "13"}
+    )
+    client._authenticated_sdk = Mock(return_value=sdk)
+
+    report = client.run_preflight(_live_config())
+
+    assert report.country == "JP"
+    assert report.region == "13"
+    sdk.get_open_orders.assert_called_once_with(only_first_page=True)
+
+
 def test_preflight_rejects_insufficient_allowance() -> None:
     sdk = Mock()
     sdk.get_balance_allowance.return_value = {

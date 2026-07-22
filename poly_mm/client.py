@@ -14,6 +14,11 @@ from poly_mm.models import Level, ManagedOrder, OrderBook, PreflightReport, Quot
 
 logger = logging.getLogger("poly-mm")
 COLLATERAL_SCALE = Decimal(10**6)
+# Polymarket documents Japan as restricted in its frontend UI only; CLOB API
+# trading is not restricted there. The geoblock endpoint still reports the IP
+# as blocked, so preflight must distinguish it from API-blocked jurisdictions.
+# https://docs.polymarket.com/api-reference/geoblock
+FRONTEND_ONLY_RESTRICTED_COUNTRIES = frozenset({"JP"})
 
 
 class PolymarketClient:
@@ -59,17 +64,25 @@ class PolymarketClient:
             )
 
         geo = self.check_geoblock()
-        if bool(geo.get("blocked")):
+        country = str(geo.get("country") or "").upper()
+        if bool(geo.get("blocked")) and country not in FRONTEND_ONLY_RESTRICTED_COUNTRIES:
             location = "/".join(
                 value
                 for value in [
-                    str(geo.get("country") or ""),
+                    country,
                     str(geo.get("region") or ""),
                 ]
                 if value
             )
             raise RuntimeError(
                 f"Polymarket trading is blocked for this VPS IP ({location or 'unknown'})"
+            )
+        if bool(geo.get("blocked")):
+            logger.warning(
+                "Polymarket frontend UI is restricted at location %s/%s; "
+                "continuing CLOB API preflight because the API is not restricted there",
+                country,
+                str(geo.get("region") or ""),
             )
 
         sdk = self._authenticated_sdk()
@@ -107,7 +120,7 @@ class PolymarketClient:
             funder_address=funder,
             collateral_balance=balance,
             minimum_allowance=minimum_allowance,
-            country=str(geo.get("country") or ""),
+            country=country,
             region=str(geo.get("region") or ""),
         )
 
