@@ -27,6 +27,10 @@
             <svg viewBox="0 0 24 24"><path d="M4 7h16M7 4v6m10 4v6M4 17h16" /></svg>
             挂单任务<span id="market-count" class="nav-count">0</span>
           </button>
+          <button data-view="logs-view">
+            <svg viewBox="0 0 24 24"><path d="M5 4h14v16H5zM8 8h8M8 12h8M8 16h5" /></svg>
+            运行日志
+          </button>
         </nav>
         <div class="sidebar-spacer"></div>
         <div class="server-card">
@@ -69,6 +73,7 @@
                 <div class="risk-row"><strong>成交后停止对应 token</strong><span id="fill-guard">—</span></div>
               </div></section>
               <section class="card"><div class="card-head"><div><h2>实盘预检</h2><p>余额、allowance、凭据与地区限制</p></div><button class="text-button" data-view-target="account">前往账户设置</button></div><div class="card-body"><p id="preflight-summary" class="preflight-summary">尚未运行预检。</p></div></section>
+              <section class="card"><div class="card-head"><div><h2>最新日志</h2><p>最近的运行信息</p></div><button class="text-button" data-view-target="logs-view">全部日志</button></div><div class="card-body"><pre id="dashboard-logs" class="log-preview" tabindex="0">等待日志…</pre></div></section>
             </div>
           </div>
 
@@ -114,6 +119,11 @@
             <div class="section-title"><div><h2>风险与刷新</h2><p>当前 config.toml 中生效的只读配置</p></div><span id="task-mode" class="summary">正在读取</span></div>
             <div class="config-grid"><div><span>单笔最大数量</span><strong id="max-order-size">—</strong></div><div><span>单 token 最大仓位</span><strong id="max-position">—</strong></div><div><span>总开放名义金额</span><strong id="max-notional">—</strong></div><div><span>撤单刷新秒数</span><strong id="cancel-seconds">—</strong></div></div>
           </section>
+        </section>
+
+        <section id="logs-view" class="view">
+          <header class="topbar"><div><p class="eyebrow">SYSTEM LOGS</p><h1>运行日志</h1><p class="subtitle">查看机器人、订单和成交保护的完整记录</p></div><div class="actions"><span id="log-refresh-status" class="status-badge"><span class="dot"></span><span id="log-refresh-status-text">每 2 秒更新</span></span><button id="refresh-logs" class="btn primary">刷新</button></div></header>
+          <section class="card page-card"><div class="card-head"><div><h2>实时日志</h2><p>点击日志或选择文字时暂停更新；点击日志框外恢复</p></div></div><div class="card-body"><pre id="logs" class="full-log" tabindex="0">等待日志…</pre></div></section>
         </section>
       </div></main>
     </div>

@@ -1,7 +1,27 @@
 import asyncio
+import logging
 import os
 
-from poly_mm.web import ACCOUNT_ENV_KEYS, DashboardController
+from poly_mm.web import ACCOUNT_ENV_KEYS, DashboardController, MemoryLogHandler
+
+
+def test_memory_log_handler_is_bounded_and_redacts_secrets() -> None:
+    handler = MemoryLogHandler(maximum=2)
+    logger = logging.getLogger("poly-mm-test-memory")
+    logger.handlers = [handler]
+    logger.propagate = False
+    private_key = "0x" + "a" * 64
+
+    logger.info("first")
+    logger.warning("POLYMARKET_API_SECRET=secret-value")
+    logger.error("signing material %s", private_key)
+
+    lines = list(handler.lines)
+    assert len(lines) == 2
+    assert "first" not in "\n".join(lines)
+    assert "secret-value" not in "\n".join(lines)
+    assert private_key not in "\n".join(lines)
+    assert lines[-1].endswith("signing material [REDACTED_PRIVATE_KEY]")
 
 
 def test_web_controller_supports_zero_markets_but_refuses_task_start(tmp_path) -> None:

@@ -86,6 +86,11 @@ def test_console_status_and_pause_action_without_login(tmp_path) -> None:
             assert payload["dry_run"] is True
             assert "private_key" not in payload
 
+            logs_request = Request(f"{origin}/api/logs")
+            status, payload = await asyncio.to_thread(_read, logs_request)
+            assert status == 200
+            assert payload == {"lines": []}
+
             rejected = Request(f"{origin}/api/pause", method="POST")
             status, payload = await asyncio.to_thread(_read, rejected)
             assert status == 403

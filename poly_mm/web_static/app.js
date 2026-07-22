@@ -5,11 +5,19 @@ const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (character
 
 let expiryFormDirty = false;
 let accountFormDirty = false;
+const logPanels = [...document.querySelectorAll('.log-preview, .full-log')];
+const logRefreshStatus = byId('log-refresh-status');
+const logRefreshStatusText = byId('log-refresh-status-text');
+let logInteractionPaused = false;
+let logRefreshPaused = false;
+let logRefreshPending = false;
+let logRequestInFlight = false;
 
 function showView(name) {
   document.querySelectorAll('.view').forEach((view) => view.classList.toggle('active', view.id === name));
   document.querySelectorAll('.nav button[data-view]').forEach((button) => button.classList.toggle('active', button.dataset.view === name));
   window.scrollTo({ top: 0, behavior: 'smooth' });
+  if (name === 'logs-view') refreshLogs({ force: true });
 }
 
 function showNotice(message, isError = false) {
@@ -145,6 +153,64 @@ async function refresh() {
   }
 }
 
+function selectionIsInsideLogs() {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) return false;
+  return logPanels.some((panel) => (
+    (selection.anchorNode && panel.contains(selection.anchorNode))
+    || (selection.focusNode && panel.contains(selection.focusNode))
+  ));
+}
+
+function updateLogRefreshPauseState() {
+  const paused = logInteractionPaused || selectionIsInsideLogs();
+  if (paused === logRefreshPaused) return;
+  logRefreshPaused = paused;
+  logPanels.forEach((panel) => panel.classList.toggle('paused', paused));
+  logRefreshStatus.classList.toggle('paused', paused);
+  logRefreshStatusText.textContent = paused
+    ? '已暂停（点击日志外恢复）'
+    : '每 2 秒更新';
+  if (!paused) refreshLogs({ force: true });
+}
+
+async function refreshLogs({ force = false } = {}) {
+  if (!force && logRefreshPaused) {
+    logRefreshPending = true;
+    return;
+  }
+  if (logRequestInFlight) {
+    logRefreshPending = true;
+    return;
+  }
+  logRequestInFlight = true;
+  try {
+    const response = await fetch('/api/logs', { cache: 'no-store' });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    if (!force && logRefreshPaused) {
+      logRefreshPending = true;
+      return;
+    }
+    const lines = Array.isArray(payload.lines) ? payload.lines : [];
+    const logs = byId('logs');
+    logs.textContent = lines.length ? lines.join('\n') : '暂无运行日志。';
+    logs.scrollTop = logs.scrollHeight;
+    const preview = byId('dashboard-logs');
+    preview.textContent = lines.length ? lines.slice(-6).join('\n') : '暂无运行日志。';
+    preview.scrollTop = preview.scrollHeight;
+    logRefreshPending = false;
+  } catch (error) {
+    showNotice(`日志读取失败：${error.message}`, true);
+  } finally {
+    logRequestInFlight = false;
+    if (!logRefreshPaused && logRefreshPending) {
+      logRefreshPending = false;
+      queueMicrotask(() => refreshLogs({ force: true }));
+    }
+  }
+}
+
 async function action(path, { body, confirmText } = {}) {
   if (confirmText && !window.confirm(confirmText)) return false;
   document.querySelectorAll('button').forEach((button) => { button.disabled = true; });
@@ -167,11 +233,35 @@ async function action(path, { body, confirmText } = {}) {
 
 document.querySelectorAll('.nav button[data-view]').forEach((button) => { button.addEventListener('click', () => showView(button.dataset.view)); });
 document.querySelectorAll('[data-view-target]').forEach((button) => { button.addEventListener('click', () => showView(button.dataset.viewTarget)); });
+logPanels.forEach((panel) => {
+  panel.addEventListener('focus', () => {
+    logInteractionPaused = true;
+    updateLogRefreshPauseState();
+  });
+  panel.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    window.getSelection()?.removeAllRanges();
+    logInteractionPaused = false;
+    panel.blur();
+    updateLogRefreshPauseState();
+  });
+});
+document.addEventListener('pointerdown', (event) => {
+  if (event.target.closest?.('.log-preview, .full-log')) {
+    logInteractionPaused = true;
+    updateLogRefreshPauseState();
+    return;
+  }
+  logInteractionPaused = false;
+  requestAnimationFrame(updateLogRefreshPauseState);
+});
+document.addEventListener('selectionchange', updateLogRefreshPauseState);
 byId('start-button').addEventListener('click', () => action('/api/start', { confirmText: '确认启动挂单任务？实盘预检通过后会提交真实订单。' }));
 byId('stop-button').addEventListener('click', () => action('/api/stop'));
 byId('pause-button').addEventListener('click', () => action('/api/pause'));
 byId('resume-button').addEventListener('click', () => action('/api/resume'));
 byId('run-preflight').addEventListener('click', () => action('/api/preflight'));
+byId('refresh-logs').addEventListener('click', () => refreshLogs({ force: true }));
 
 byId('account-form').addEventListener('input', () => { accountFormDirty = true; });
 byId('account-form').addEventListener('submit', async (event) => {
@@ -202,4 +292,5 @@ byId('apply-expiry').addEventListener('click', async () => {
 
 syncExpiryControls();
 refresh();
-window.setInterval(refresh, 2000);
+refreshLogs();
+window.setInterval(() => { refresh(); refreshLogs(); }, 2000);

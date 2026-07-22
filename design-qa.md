@@ -21,7 +21,7 @@
 
 **Open Questions**
 
-- None. The removed Predictfun-only “运行日志” page and the Polymarket-specific “挂单任务” content are intentional product differences, not visual drift.
+- None. The Polymarket-specific “挂单任务” content is an intentional product difference, not visual drift. The Predictfun-style “运行日志” page has since been added to the same navigation and card system.
 
 **Implementation Checklist**
 

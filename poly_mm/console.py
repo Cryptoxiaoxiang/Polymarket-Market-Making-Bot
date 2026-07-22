@@ -102,6 +102,10 @@ class _ConsoleHandler(BaseHTTPRequestHandler):
                 )
             except Exception as error:
                 self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(error)})
+        elif path == "/api/logs":
+            log_lines = getattr(self.console.controller, "log_lines", None)
+            lines = log_lines() if callable(log_lines) else []
+            self._send_json(HTTPStatus.OK, {"lines": lines})
         elif path == "/healthz":
             self._send_json(HTTPStatus.OK, {"ok": True})
         else:

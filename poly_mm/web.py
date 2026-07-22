@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import signal
+from collections import deque
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,29 @@ ACCOUNT_ENV_KEYS = {
     "POLYMARKET_API_SECRET",
     "POLYMARKET_API_PASSPHRASE",
 }
+SECRET_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)\b(POLYMARKET_(?:PRIVATE_KEY|API_KEY|API_SECRET|API_PASSPHRASE)|"
+    r"private[_ -]?key|api[_ -]?(?:key|secret)|passphrase)\b(\s*[:=]\s*)([^\s,;]+)"
+)
+PRIVATE_KEY_PATTERN = re.compile(r"(?<![0-9a-fA-F])0x[0-9a-fA-F]{64}(?![0-9a-fA-F])")
+
+
+class MemoryLogHandler(logging.Handler):
+    """Bounded, redacted in-memory log stream for the loopback web console."""
+
+    def __init__(self, maximum: int = 300) -> None:
+        super().__init__()
+        self.lines: deque[str] = deque(maxlen=maximum)
+        self.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            line = self.format(record)
+            line = SECRET_ASSIGNMENT_PATTERN.sub(r"\1\2[REDACTED]", line)
+            line = PRIVATE_KEY_PATTERN.sub("[REDACTED_PRIVATE_KEY]", line)
+            self.lines.append(line)
+        except Exception:  # pragma: no cover - logging must never interrupt trading
+            self.handleError(record)
 
 
 class DashboardController:
@@ -39,6 +63,8 @@ class DashboardController:
         self.task: asyncio.Task[None] | None = None
         self.last_error = ""
         self.last_preflight: PreflightReport | None = None
+        self.log_handler = MemoryLogHandler()
+        self.memory_logging_enabled = False
         self.lock = asyncio.Lock()
 
     @property
@@ -47,6 +73,21 @@ class DashboardController:
 
     def settings(self) -> Settings:
         return Settings.from_env(self.env_path)
+
+    def enable_memory_logging(self) -> None:
+        if self.memory_logging_enabled:
+            return
+        logging.getLogger("poly-mm").addHandler(self.log_handler)
+        self.memory_logging_enabled = True
+
+    def disable_memory_logging(self) -> None:
+        if not self.memory_logging_enabled:
+            return
+        logging.getLogger("poly-mm").removeHandler(self.log_handler)
+        self.memory_logging_enabled = False
+
+    def log_lines(self) -> list[str]:
+        return list(self.log_handler.lines)
 
     def account_status(self) -> dict[str, Any]:
         settings = self.settings()
@@ -302,6 +343,7 @@ async def async_main() -> None:
     args = parse_args()
     config = load_config(args.config, require_markets=False)
     controller = DashboardController(args.config, args.env)
+    controller.enable_memory_logging()
     console = ConsoleServer(
         controller,
         host=config.console_host,
@@ -318,6 +360,7 @@ async def async_main() -> None:
     finally:
         await controller.shutdown()
         console.stop()
+        controller.disable_memory_logging()
 
 
 def parse_args() -> argparse.Namespace:
