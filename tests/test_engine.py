@@ -275,6 +275,68 @@ def test_websocket_partial_fill_halts_token_and_cancels_order(tmp_path) -> None:
     assert OrderJournal(tmp_path / "orders.json").load() == []
 
 
+def test_user_event_consumer_handles_fill_without_waiting_for_quote_tick(tmp_path) -> None:
+    client = FakeClient(tmp_path / "orders.json")
+    client.open_orders = [{"id": "order-1"}]
+    engine = MarketMakerEngine(
+        BotConfig(
+            sell_on_fill=True,
+            cancel_retry_base_seconds=0,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+    )
+    order = _order()
+    engine.orders = {order.order_id: order}
+
+    async def scenario() -> dict:
+        consumer = asyncio.create_task(engine._consume_user_events())
+        try:
+            await engine._user_events.put(
+                {
+                    "event_type": "trade",
+                    "type": "TRADE",
+                    "timestamp": str(time() - 0.05),
+                    "maker_orders": [
+                        {
+                            "order_id": "order-1",
+                            "matched_amount": "2",
+                        }
+                    ],
+                }
+            )
+            await asyncio.wait_for(engine._user_events.join(), timeout=1)
+            await asyncio.gather(*engine._exit_tasks)
+            return await engine.snapshot()
+        finally:
+            consumer.cancel()
+            try:
+                await consumer
+            except asyncio.CancelledError:
+                pass
+
+    snapshot = asyncio.run(scenario())
+
+    assert client.created[0][0].side == Side.SELL
+    assert client.created[0][0].size == Decimal("2")
+    assert snapshot["monitoring"]["websocket_event_count"] == 1
+    assert snapshot["monitoring"]["last_fill_source"] == "WebSocket"
+    assert 0 <= snapshot["monitoring"]["last_fill_detection_latency_ms"] < 1_000
+    assert snapshot["monitoring"]["last_exit_submission_latency_ms"] is not None
+
+
+def test_active_buy_orders_use_fast_reconciliation_intervals(tmp_path) -> None:
+    engine = MarketMakerEngine(_config(), FakeClient(tmp_path / "orders.json"))
+
+    assert engine._current_reconcile_interval() == 2
+    assert engine._current_position_interval() == 5
+
+    engine.orders = {"order-1": _order()}
+
+    assert engine._current_reconcile_interval() == 0.5
+    assert engine._current_position_interval() == 1
+
+
 def test_tick_fetches_books_and_submits_independent_quotes_concurrently(tmp_path) -> None:
     class ConcurrentQuoteClient(FakeClient):
         def __init__(self, journal_path) -> None:
@@ -364,6 +426,35 @@ def test_buy_fill_submits_same_size_sell_at_one_cent(tmp_path) -> None:
     assert post_only is False
     assert engine.pending_exits == {}
     assert engine.orders["exit-order"].quote.side == Side.SELL
+
+
+def test_buy_fill_uses_one_tenth_cent_for_fine_tick_market(tmp_path) -> None:
+    client = FakeClient(tmp_path / "orders.json")
+    client.open_orders = [{"id": "order-1"}]
+    engine = MarketMakerEngine(
+        BotConfig(
+            sell_on_fill=True,
+            cancel_retry_base_seconds=0,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+    )
+    engine.latest_books["token-1"] = {"tick_size": "0.001"}
+    order = _order()
+    order.filled_size = Decimal("1.25")
+    engine.orders = {order.order_id: order}
+
+    async def scenario() -> None:
+        await engine._handle_fill(order, source="WebSocket")
+        await asyncio.gather(*engine._exit_tasks)
+
+    asyncio.run(scenario())
+
+    quote, post_only = client.created[0]
+    assert quote.side == Side.SELL
+    assert quote.price == Decimal("0.001")
+    assert quote.size == Decimal("1.25")
+    assert post_only is False
 
 
 def test_fill_exit_starts_before_buy_cancellation_finishes(tmp_path) -> None:
@@ -514,6 +605,86 @@ def test_fill_exit_clears_untradeable_residue_after_repeated_balance_errors(
     assert OrderJournal(tmp_path / "orders.json").load_pending_exits() == []
 
 
+def test_invalid_exit_token_is_archived_after_zero_position_confirmation(
+    tmp_path,
+) -> None:
+    class InvalidTokenClient(FakeClient):
+        def __init__(self, journal_path) -> None:
+            super().__init__(journal_path)
+            self.attempts = 0
+
+        def create_order(
+            self,
+            quote: Quote,
+            *,
+            post_only: bool = True,
+            tick_size: Decimal | None = None,
+            submission_key: str | None = None,
+        ) -> ManagedOrder:
+            self.attempts += 1
+            raise RuntimeError("invalid token id")
+
+    client = InvalidTokenClient(tmp_path / "orders.json")
+    engine = MarketMakerEngine(_config(), client)
+    engine._exit_retry_base_seconds = 0
+    intent = ExitIntent(
+        intent_id="buy-1:1",
+        source_order_id="buy-1",
+        token_id="token-1",
+        size=Decimal("1"),
+        neg_risk=False,
+        created_at=time() - 31,
+    )
+    engine.pending_exits = {intent.intent_id: intent}
+    engine._persist_orders()
+
+    asyncio.run(engine._submit_fill_exit(intent))
+
+    assert client.attempts == 3
+    assert client.discarded_submission_keys == [intent.intent_id]
+    assert engine.pending_exits == {}
+    assert OrderJournal(tmp_path / "orders.json").load_pending_exits() == []
+
+
+def test_invalid_exit_token_with_position_pauses_and_preserves_intent(tmp_path) -> None:
+    class InvalidTokenClient(FakeClient):
+        def __init__(self, journal_path) -> None:
+            super().__init__(journal_path)
+            self.attempts = 0
+            self.positions = {"token-1": Decimal("1")}
+
+        def create_order(
+            self,
+            quote: Quote,
+            *,
+            post_only: bool = True,
+            tick_size: Decimal | None = None,
+            submission_key: str | None = None,
+        ) -> ManagedOrder:
+            self.attempts += 1
+            raise RuntimeError("invalid token id")
+
+    client = InvalidTokenClient(tmp_path / "orders.json")
+    engine = MarketMakerEngine(_config(), client)
+    engine._exit_retry_base_seconds = 0
+    intent = ExitIntent(
+        intent_id="buy-1:1",
+        source_order_id="buy-1",
+        token_id="token-1",
+        size=Decimal("1"),
+        neg_risk=False,
+        created_at=time() - 31,
+    )
+    engine.pending_exits = {intent.intent_id: intent}
+
+    asyncio.run(engine._submit_fill_exit(intent))
+
+    assert client.attempts == 3
+    assert engine.paused is True
+    assert "1 share(s) remain" in engine.last_error
+    assert engine.pending_exits == {intent.intent_id: intent}
+
+
 def test_position_increase_for_tracked_buy_submits_fill_exit(tmp_path) -> None:
     client = FakeClient(tmp_path / "orders.json")
     engine = MarketMakerEngine(
@@ -629,6 +800,36 @@ def test_pending_fill_exit_survives_restart(tmp_path) -> None:
 
     assert client.created[0][0].side == Side.SELL
     assert client.created[0][0].price == Decimal("0.01")
+    assert client.created[0][0].size == Decimal("3")
+    assert journal.load_pending_exits() == []
+
+
+def test_fine_tick_pending_exit_keeps_one_tenth_cent_price_after_restart(
+    tmp_path,
+) -> None:
+    journal = OrderJournal(tmp_path / "orders.json")
+    intent = ExitIntent(
+        intent_id="buy-1:3",
+        source_order_id="buy-1",
+        token_id="token-1",
+        size=Decimal("3"),
+        neg_risk=False,
+        created_at=time(),
+        tick_size=Decimal("0.001"),
+    )
+    journal.save([], pending_exits=[intent])
+    client = FakeClient(journal.path)
+    engine = MarketMakerEngine(_config(), client, journal)
+    engine._restore_orders()
+
+    async def scenario() -> None:
+        engine._resume_pending_exits()
+        await asyncio.gather(*engine._exit_tasks)
+
+    asyncio.run(scenario())
+
+    assert client.created[0][0].side == Side.SELL
+    assert client.created[0][0].price == Decimal("0.001")
     assert client.created[0][0].size == Decimal("3")
     assert journal.load_pending_exits() == []
 

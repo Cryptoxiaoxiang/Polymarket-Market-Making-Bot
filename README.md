@@ -181,15 +181,19 @@ SSH 隧道访问。
 `market_slug`。关键运行参数：
 
 - `preflight_enabled`：实盘启动保护，不建议关闭。
-- `websocket_enabled`：启用用户订单/成交实时事件；REST 对账不会因此关闭。
-- `position_poll_interval_seconds`：已有仓位同步间隔。
+- `websocket_enabled`：启用独立的用户订单/成交实时消费者；事件不等待挂单循环。
+- `position_poll_interval_seconds`：常规仓位同步间隔；存在活动 BUY 时自动缩短至最多
+  1 秒，同时订单 REST 对账自动缩短至最多 0.5 秒。
 - `cancel_after_seconds`：单笔挂单多少秒后撤销并等待下一轮重挂。
 - `cancel_retry_count` / `cancel_retry_base_seconds`：可靠撤单重试。
 - `console_enabled` / `console_host` / `console_port`：本机控制台；host 必须是
   loopback 地址，默认 `127.0.0.1:8081`。
 - `halt_on_fill`：任何部分成交或已有仓位出现后停止该 token。
-- `sell_on_fill`：机器人 BUY 单部分或全部成交后，以 `$0.01` 非 post-only GTC 限价单
-  卖出新增成交份数；默认开启，可能立即吃掉买盘并产生明显亏损。
+- `sell_on_fill`：机器人 BUY 单部分或全部成交后，以非 post-only GTC 限价单卖出新增
+  成交份数；tick 为 `$0.001` 时保护价使用 `$0.001`，否则使用 `$0.01`。默认开启，
+  可能立即吃掉买盘并产生明显亏损。
+- 连续收到 `invalid token id` 的保护卖单会先核验真实持仓：零持仓才归档；仍有持仓
+  则暂停挂单并保留恢复记录，避免无限重试或静默遗留仓位。
 - `cancel_all_on_start`：启动时撤销配置 token 的账户订单并确认清空。
 - `cancel_all_on_shutdown`：SIGTERM/SIGINT 时撤销所有跟踪订单。
 

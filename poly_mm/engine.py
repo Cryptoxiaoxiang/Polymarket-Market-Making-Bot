@@ -27,8 +27,13 @@ TERMINAL_ORDER_STATUSES = {
     "FAILED",
 }
 EXIT_LIMIT_PRICE = Decimal("0.01")
+FINE_TICK_EXIT_LIMIT_PRICE = Decimal("0.001")
 MIN_EXIT_SIZE = Decimal("0.01")
 MISSING_ORDER_CONFIRMATION_ATTEMPTS = 3
+ACTIVE_BUY_RECONCILE_INTERVAL_SECONDS = 0.5
+ACTIVE_BUY_POSITION_INTERVAL_SECONDS = 1.0
+INVALID_TOKEN_CONFIRMATION_ATTEMPTS = 3
+INVALID_TOKEN_MINIMUM_AGE_SECONDS = 30.0
 
 
 class MarketMakerEngine:
@@ -50,6 +55,7 @@ class MarketMakerEngine:
         self.stop = asyncio.Event()
         self._user_events: asyncio.Queue[dict] = asyncio.Queue()
         self._websocket_task: asyncio.Task[None] | None = None
+        self._websocket_consumer_task: asyncio.Task[None] | None = None
         self._exit_tasks: set[asyncio.Task[None]] = set()
         self._exit_retry_base_seconds = 0.1
         self._next_position_poll_at = 0.0
@@ -63,6 +69,14 @@ class MarketMakerEngine:
         self.latest_books: dict[str, dict[str, str | bool]] = {}
         self.quote_deadline_at: float | None = None
         self.quote_task_expired = False
+        self.websocket_event_count = 0
+        self.last_websocket_event_at: float | None = None
+        self.last_fill_source = ""
+        self.last_fill_matched_at: float | None = None
+        self.last_fill_detected_at: float | None = None
+        self.last_fill_detection_latency_ms: float | None = None
+        self.last_exit_submitted_at: float | None = None
+        self.last_exit_submission_latency_ms: float | None = None
 
     def request_stop(self) -> None:
         self.stop.set()
@@ -97,18 +111,22 @@ class MarketMakerEngine:
             self._resume_pending_exits()
 
             if not self.config.dry_run and self.config.websocket_enabled:
+                self._websocket_consumer_task = asyncio.create_task(
+                    self._consume_user_events()
+                )
                 self._websocket_task = asyncio.create_task(self._watch_user_events())
 
             self.phase = "running"
             while not self.stop.is_set():
-                await self._drain_user_events()
                 tick_started = monotonic()
                 await self._tick()
                 remaining_interval = max(
                     0.01,
-                    self.config.poll_interval_seconds - (monotonic() - tick_started),
+                    self._current_reconcile_interval()
+                    - (monotonic() - tick_started),
                 )
-                await self._wait_for_event_or_poll(remaining_interval)
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self.stop.wait(), timeout=remaining_interval)
         except Exception as error:
             self.phase = "error"
             self.last_error = str(error)
@@ -121,6 +139,10 @@ class MarketMakerEngine:
                 self._websocket_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await self._websocket_task
+            if self._websocket_consumer_task is not None:
+                self._websocket_consumer_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._websocket_consumer_task
             if self._exit_tasks:
                 # Let an in-flight CLOB submission return so a successfully
                 # accepted SELL is journaled before shutdown cancellation.
@@ -254,6 +276,25 @@ class MarketMakerEngine:
                 (monotonic() - batch_started) * 1000,
             )
 
+    def _has_active_buy_orders(self) -> bool:
+        return any(order.quote.side == Side.BUY for order in self.orders.values())
+
+    def _current_reconcile_interval(self) -> float:
+        if self._has_active_buy_orders():
+            return min(
+                self.config.poll_interval_seconds,
+                ACTIVE_BUY_RECONCILE_INTERVAL_SECONDS,
+            )
+        return self.config.poll_interval_seconds
+
+    def _current_position_interval(self) -> float:
+        if self._has_active_buy_orders():
+            return min(
+                self.config.position_poll_interval_seconds,
+                ACTIVE_BUY_POSITION_INTERVAL_SECONDS,
+            )
+        return self.config.position_poll_interval_seconds
+
     async def _refresh_positions_if_due(self) -> bool:
         now = monotonic()
         if now < self._next_position_poll_at:
@@ -270,7 +311,7 @@ class MarketMakerEngine:
         if first_snapshot:
             self._position_baseline = dict(refreshed)
             self._positions_initialized = True
-        self._next_position_poll_at = now + self.config.position_poll_interval_seconds
+        self._next_position_poll_at = now + self._current_position_interval()
         if self.config.halt_on_fill:
             for market in self.config.enabled_markets:
                 size = self.positions.get(market.token_id, Decimal())
@@ -535,11 +576,25 @@ class MarketMakerEngine:
                 self.orders.pop(order.order_id, None)
                 self._persist_orders()
 
-    async def _handle_fill(self, order: ManagedOrder, source: str) -> None:
+    async def _handle_fill(
+        self,
+        order: ManagedOrder,
+        source: str,
+        *,
+        matched_at: float | None = None,
+    ) -> None:
         if order.quote.side != Side.BUY:
             return
         intent = self._queue_fill_exit(order, source)
         if intent is not None:
+            self.last_fill_source = source
+            self.last_fill_matched_at = matched_at
+            self.last_fill_detected_at = intent.created_at
+            self.last_fill_detection_latency_ms = (
+                max(0.0, (intent.created_at - matched_at) * 1000)
+                if matched_at is not None
+                else None
+            )
             # Do not put cancellation round trips on the protective SELL's
             # critical path. The task starts as soon as cancellation yields.
             self._schedule_exit(intent)
@@ -629,10 +684,11 @@ class MarketMakerEngine:
         self.pending_exits[intent_id] = intent
         self._persist_orders()
         logger.critical(
-            "%s BUY fill detected for %s; queued SELL %s shares at $0.01",
+            "%s BUY fill detected for %s; queued SELL %s shares at $%s",
             source,
             order.quote.token_id,
             size,
+            _exit_limit_price(intent.tick_size),
         )
         return intent
 
@@ -656,6 +712,7 @@ class MarketMakerEngine:
     async def _submit_fill_exit(self, intent: ExitIntent) -> None:
         attempt = 0
         balance_failures = 0
+        invalid_token_failures = 0
         cached_book = self.latest_books.get(intent.token_id, {})
         cached_tick = cached_book.get("tick_size")
         tick_size = (
@@ -663,12 +720,13 @@ class MarketMakerEngine:
             or (Decimal(str(cached_tick)) if cached_tick else None)
             or EXIT_LIMIT_PRICE
         )
+        exit_limit_price = _exit_limit_price(tick_size)
         while not self.stop.is_set() and intent.intent_id in self.pending_exits:
             attempt += 1
             quote = Quote(
                 token_id=intent.token_id,
                 side=Side.SELL,
-                price=EXIT_LIMIT_PRICE,
+                price=exit_limit_price,
                 size=intent.size,
                 neg_risk=intent.neg_risk,
             )
@@ -684,6 +742,17 @@ class MarketMakerEngine:
                 raise
             except Exception as error:
                 error_text = str(error).casefold()
+                if "invalid token id" in error_text:
+                    invalid_token_failures += 1
+                    if (
+                        invalid_token_failures >= INVALID_TOKEN_CONFIRMATION_ATTEMPTS
+                        and time() - intent.created_at
+                        >= INVALID_TOKEN_MINIMUM_AGE_SECONDS
+                        and await self._resolve_invalid_exit_token(intent)
+                    ):
+                        return
+                else:
+                    invalid_token_failures = 0
                 if "balance" in error_text or "allowance" in error_text:
                     balance_failures += 1
                     try:
@@ -747,8 +816,9 @@ class MarketMakerEngine:
                     1.6,
                 )
                 logger.critical(
-                    "$0.01 SELL attempt %d failed for %s after %.0fms; "
+                    "$%s SELL attempt %d failed for %s after %.0fms; "
                     "retrying in %.1fs: %s",
+                    exit_limit_price,
                     attempt,
                     intent.token_id,
                     (time() - intent.created_at) * 1000,
@@ -761,9 +831,14 @@ class MarketMakerEngine:
             self.orders[exit_order.order_id] = exit_order
             self.pending_exits.pop(intent.intent_id, None)
             self._persist_orders()
+            self.last_exit_submitted_at = time()
+            self.last_exit_submission_latency_ms = (
+                self.last_exit_submitted_at - intent.created_at
+            ) * 1000
             logger.critical(
-                "$0.01 SELL submitted for %s shares on %s: %s "
+                "$%s SELL submitted for %s shares on %s: %s "
                 "(fill-to-submit %.0fms, attempts=%d)",
+                exit_limit_price,
                 intent.size,
                 intent.token_id,
                 exit_order.order_id,
@@ -771,6 +846,35 @@ class MarketMakerEngine:
                 attempt,
             )
             return
+
+    async def _resolve_invalid_exit_token(self, intent: ExitIntent) -> bool:
+        """Stop deterministic invalid-token retries after a position safety check."""
+        try:
+            positions = await asyncio.to_thread(self.client.get_positions, None)
+        except Exception as error:
+            logger.warning(
+                "Unable to verify position for invalid protective SELL token %s: %s",
+                intent.token_id,
+                error,
+            )
+            return False
+        position = positions.get(intent.token_id, Decimal())
+        if position <= 0:
+            self.client.discard_prepared_order(intent.intent_id)
+            self.pending_exits.pop(intent.intent_id, None)
+            self._persist_orders()
+            logger.critical(
+                "Archived invalid protective SELL for %s after confirming zero position",
+                intent.token_id,
+            )
+            return True
+        self.paused = True
+        self.last_error = (
+            "Protective SELL token is invalid while "
+            f"{position} share(s) remain for {intent.token_id}; quoting paused"
+        )
+        logger.critical(self.last_error)
+        return True
 
     async def _watch_user_events(self) -> None:
         condition_ids = list(
@@ -796,16 +900,32 @@ class MarketMakerEngine:
                 await asyncio.wait_for(self.stop.wait(), timeout=backoff)
             backoff = min(backoff * 2, 30)
 
-    async def _drain_user_events(self) -> None:
+    async def _consume_user_events(self) -> None:
+        """Handle authenticated user events independently of the quote cycle."""
         while True:
+            event = await self._user_events.get()
+            received_at = time()
+            self.websocket_event_count += 1
+            self.last_websocket_event_at = received_at
             try:
-                event = self._user_events.get_nowait()
-            except asyncio.QueueEmpty:
-                return
-            await self._handle_user_event(event)
+                await self._handle_user_event(event, received_at=received_at)
+            finally:
+                self._user_events.task_done()
 
-    async def _handle_user_event(self, event: dict) -> None:
+    async def _handle_user_event(
+        self,
+        event: dict,
+        *,
+        received_at: float | None = None,
+    ) -> None:
         event_kind = str(event.get("event_type") or "").casefold()
+        matched_at = _event_timestamp(event)
+        if received_at is not None and matched_at is not None:
+            logger.info(
+                "User WebSocket %s event received in %.0fms",
+                event_kind or "unknown",
+                max(0.0, (received_at - matched_at) * 1000),
+            )
         if event_kind == "order":
             order = self.orders.get(str(event.get("id") or ""))
             if order is None:
@@ -814,7 +934,11 @@ class MarketMakerEngine:
             if filled > order.filled_size:
                 order.filled_size = filled
                 self._persist_orders()
-                await self._handle_fill(order, source="WebSocket")
+                await self._handle_fill(
+                    order,
+                    source="WebSocket",
+                    matched_at=matched_at,
+                )
             if str(event.get("type") or "").upper() == "CANCELLATION":
                 self.orders.pop(order.order_id, None)
                 self._persist_orders()
@@ -837,17 +961,11 @@ class MarketMakerEngine:
                 if filled > order.filled_size:
                     order.filled_size = filled
                     self._persist_orders()
-                await self._handle_fill(order, source="WebSocket")
-
-    async def _wait_for_event_or_poll(self, timeout: float | None = None) -> None:
-        try:
-            event = await asyncio.wait_for(
-                self._user_events.get(),
-                timeout=(self.config.poll_interval_seconds if timeout is None else timeout),
-            )
-        except asyncio.TimeoutError:
-            return
-        await self._handle_user_event(event)
+                await self._handle_fill(
+                    order,
+                    source="WebSocket",
+                    matched_at=matched_at,
+                )
 
     async def pause_quotes(self) -> dict:
         """Pause new quotes and cancel every order tracked by this process."""
@@ -969,6 +1087,22 @@ class MarketMakerEngine:
                 ),
                 "expired": self.quote_task_expired,
             },
+            "monitoring": {
+                "websocket_event_count": self.websocket_event_count,
+                "last_websocket_event_at": self.last_websocket_event_at,
+                "last_fill_source": self.last_fill_source,
+                "last_fill_matched_at": self.last_fill_matched_at,
+                "last_fill_detected_at": self.last_fill_detected_at,
+                "last_fill_detection_latency_ms": self.last_fill_detection_latency_ms,
+                "last_exit_submitted_at": self.last_exit_submitted_at,
+                "last_exit_submission_latency_ms": self.last_exit_submission_latency_ms,
+                "active_order_reconcile_interval_seconds": (
+                    self._current_reconcile_interval()
+                ),
+                "position_reconcile_interval_seconds": (
+                    self._current_position_interval()
+                ),
+            },
         }
 
 
@@ -995,3 +1129,22 @@ def _matched_shares(state: dict, order: ManagedOrder) -> Decimal:
     # Current order-detail responses describe sizes as 6-decimal fixed math,
     # while some legacy responses expose human shares. A ratio handles both.
     return order.quote.size * matched / original
+
+
+def _event_timestamp(event: dict) -> float | None:
+    raw = event.get("matchtime") or event.get("timestamp")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    if value >= 1_000_000_000_000:
+        value /= 1000
+    return value
+
+
+def _exit_limit_price(tick_size: Decimal | None) -> Decimal:
+    if tick_size == FINE_TICK_EXIT_LIMIT_PRICE:
+        return FINE_TICK_EXIT_LIMIT_PRICE
+    return EXIT_LIMIT_PRICE

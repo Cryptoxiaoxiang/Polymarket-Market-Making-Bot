@@ -358,6 +358,10 @@ class PolymarketClient:
                     )
                 )
                 self.websocket_connected = True
+                logger.info(
+                    "User WebSocket connected for %d configured market(s)",
+                    len(condition_ids),
+                )
                 heartbeat = asyncio.create_task(self._user_ws_heartbeat(websocket))
                 try:
                     async for raw_message in websocket:
@@ -377,6 +381,8 @@ class PolymarketClient:
                     except asyncio.CancelledError:
                         pass
         finally:
+            if self.websocket_connected:
+                logger.info("User WebSocket connection closed")
             self.websocket_connected = False
 
     @staticmethod

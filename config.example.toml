@@ -9,11 +9,13 @@ cancel_all_on_shutdown = true
 # from rebuilding inventory while you review the fill.
 halt_on_fill = true
 # After any partial BUY fill, submit the same number of shares as a non-post-only
-# GTC SELL limit at $0.01. This can cross the spread and realize a large loss.
+# GTC SELL limit at the minimum current tick ($0.001 for fine-tick markets,
+# otherwise $0.01). This can cross the spread and realize a large loss.
 sell_on_fill = true
 # Refuse live startup if geoblock, credentials, pUSD balance, or allowances fail.
 preflight_enabled = true
-# User-channel fills are fast-path notifications; REST reconciliation remains enabled.
+# User-channel fills are consumed immediately. While BUY orders are active, REST order
+# reconciliation runs at up to 0.5s and this position fallback runs at up to 1s.
 websocket_enabled = true
 position_poll_interval_seconds = 5.0
 cancel_retry_count = 4
