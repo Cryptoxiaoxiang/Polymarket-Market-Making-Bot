@@ -29,9 +29,9 @@ console_port = 8081
 # starting a quoting task; the web controller can run with zero markets.
 
 [strategy]
-# Quote one tick behind the best bid by default. Set join_best_price=true to join it.
+# Quote two ticks behind the best bid by default. Set join_best_price=true to join it.
 join_best_price = false
-min_edge_ticks = 1
+min_edge_ticks = 2
 min_spread = "0.01"
 max_spread = "0.15"
 

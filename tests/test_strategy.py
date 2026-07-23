@@ -5,11 +5,11 @@ from poly_mm.models import Level, OrderBook
 from poly_mm.strategy import PassiveMakerStrategy
 
 
-def test_quotes_one_tick_behind_best_bid() -> None:
+def test_quotes_two_ticks_behind_best_bid() -> None:
     book = OrderBook("yes", [Level(Decimal(".50"), Decimal("10"))], [Level(Decimal(".54"), Decimal("10"))], Decimal(".01"), Decimal("5"))
     quote = PassiveMakerStrategy(StrategyConfig(quote_size=Decimal("5"))).build_quote(MarketConfig("yes"), book)
     assert quote is not None
-    assert quote.price == Decimal(".49")
+    assert quote.price == Decimal(".48")
 
 
 def test_does_not_quote_tight_spread() -> None:
@@ -31,7 +31,7 @@ def test_spread_thresholds_scale_with_fine_tick_size() -> None:
     )
 
     assert quote is not None
-    assert quote.price == Decimal(".251")
+    assert quote.price == Decimal(".250")
 
 
 def test_fine_tick_spread_still_respects_scaled_minimum_and_maximum() -> None:

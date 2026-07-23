@@ -55,7 +55,7 @@ class MarketConfig:
 class StrategyConfig:
     quote_size: Decimal = Decimal("5")
     join_best_price: bool = False
-    min_edge_ticks: int = 1
+    min_edge_ticks: int = 2
     min_spread: Decimal = Decimal("0.02")
     max_spread: Decimal = Decimal("0.15")
 
