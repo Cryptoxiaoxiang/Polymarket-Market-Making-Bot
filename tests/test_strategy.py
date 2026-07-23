@@ -17,6 +17,44 @@ def test_does_not_quote_tight_spread() -> None:
     assert PassiveMakerStrategy(StrategyConfig()).build_quote(MarketConfig("yes"), book) is None
 
 
+def test_spread_thresholds_scale_with_fine_tick_size() -> None:
+    book = OrderBook(
+        "yes",
+        [Level(Decimal(".252"), Decimal("100"))],
+        [Level(Decimal(".254"), Decimal("100"))],
+        Decimal(".001"),
+        Decimal("5"),
+    )
+
+    quote = PassiveMakerStrategy(StrategyConfig()).build_quote(
+        MarketConfig("yes"), book
+    )
+
+    assert quote is not None
+    assert quote.price == Decimal(".251")
+
+
+def test_fine_tick_spread_still_respects_scaled_minimum_and_maximum() -> None:
+    strategy = PassiveMakerStrategy(StrategyConfig())
+    below_minimum = OrderBook(
+        "yes",
+        [Level(Decimal(".252"), Decimal("100"))],
+        [Level(Decimal(".253"), Decimal("100"))],
+        Decimal(".001"),
+        Decimal("5"),
+    )
+    above_maximum = OrderBook(
+        "yes",
+        [Level(Decimal(".252"), Decimal("100"))],
+        [Level(Decimal(".268"), Decimal("100"))],
+        Decimal(".001"),
+        Decimal("5"),
+    )
+
+    assert strategy.build_quote(MarketConfig("yes"), below_minimum) is None
+    assert strategy.build_quote(MarketConfig("yes"), above_maximum) is None
+
+
 def test_risk_counts_existing_positions() -> None:
     from poly_mm.config import RiskConfig
     from poly_mm.models import Quote, Side

@@ -186,6 +186,8 @@ SSH 隧道访问。
   1 秒，同时订单 REST 对账自动缩短至最多 0.5 秒。
 - 同一轮常规 BUY 报价通过官方 `/orders` 批量接口提交，每批最多 15 笔；不同市场
   按 Polymarket 的 per-market 余额规则共享账户余额。保护 SELL 仍使用独立单笔接口。
+- `min_spread` 和 `max_spread` 以 `$0.01` tick 为标准单位；当盘口 tick 为
+  `$0.001` 时，价差阈值自动缩小到十分之一，并继续按实际 tick 计算挂单价格。
 - `cancel_after_seconds`：单笔挂单多少秒后撤销并等待下一轮重挂。
 - `cancel_retry_count` / `cancel_retry_base_seconds`：可靠撤单重试。
 - `console_enabled` / `console_host` / `console_port`：本机控制台；host 必须是
