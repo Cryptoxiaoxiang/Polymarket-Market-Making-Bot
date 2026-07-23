@@ -10,16 +10,23 @@ from uuid import uuid4
 import requests
 
 from poly_mm.config import BotConfig, Settings
-from poly_mm.models import Level, ManagedOrder, OrderBook, PreflightReport, Quote
+from poly_mm.models import Level, ManagedOrder, OrderBook, PreflightReport, Quote, Side
 
 logger = logging.getLogger("poly-mm")
 COLLATERAL_SCALE = Decimal(10**6)
+MAX_ORDER_BATCH_SIZE = 15
+# Polymarket documents Japan as restricted in its frontend UI only; CLOB API
+# trading is not restricted there. The geoblock endpoint still reports the IP
+# as blocked, so preflight must distinguish it from API-blocked jurisdictions.
+# https://docs.polymarket.com/api-reference/geoblock
+FRONTEND_ONLY_RESTRICTED_COUNTRIES = frozenset({"JP"})
 
 
 class PolymarketClient:
     def __init__(self, settings: Settings, dry_run: bool) -> None:
         self.settings, self.dry_run = settings, dry_run
         self._dry_orders: dict[str, ManagedOrder] = {}
+        self._prepared_orders: dict[str, object] = {}
         self._sdk = None
         self.websocket_connected = False
 
@@ -59,17 +66,25 @@ class PolymarketClient:
             )
 
         geo = self.check_geoblock()
-        if bool(geo.get("blocked")):
+        country = str(geo.get("country") or "").upper()
+        if bool(geo.get("blocked")) and country not in FRONTEND_ONLY_RESTRICTED_COUNTRIES:
             location = "/".join(
                 value
                 for value in [
-                    str(geo.get("country") or ""),
+                    country,
                     str(geo.get("region") or ""),
                 ]
                 if value
             )
             raise RuntimeError(
                 f"Polymarket trading is blocked for this VPS IP ({location or 'unknown'})"
+            )
+        if bool(geo.get("blocked")):
+            logger.warning(
+                "Polymarket frontend UI is restricted at location %s/%s; "
+                "continuing CLOB API preflight because the API is not restricted there",
+                country,
+                str(geo.get("region") or ""),
             )
 
         sdk = self._authenticated_sdk()
@@ -86,16 +101,6 @@ class PolymarketClient:
         if not allowances:
             raise RuntimeError("CLOB returned no collateral allowance values")
         minimum_allowance = min(allowances)
-        required = config.risk.max_total_open_notional
-        if balance < required:
-            raise RuntimeError(
-                "Insufficient pUSD balance: "
-                f"{balance} available, {required} required by risk.max_total_open_notional"
-            )
-        if minimum_allowance < required:
-            raise RuntimeError(
-                f"Insufficient CLOB allowance: minimum {minimum_allowance}, {required} required"
-            )
 
         # Confirm L2 credentials can read account state before the engine can submit.
         sdk.get_open_orders(only_first_page=True)
@@ -104,7 +109,7 @@ class PolymarketClient:
             funder_address=funder,
             collateral_balance=balance,
             minimum_allowance=minimum_allowance,
-            country=str(geo.get("country") or ""),
+            country=country,
             region=str(geo.get("region") or ""),
         )
 
@@ -134,40 +139,178 @@ class PolymarketClient:
             neg_risk=bool(data.get("neg_risk", False)),
         )
 
-    def create_order(self, quote: Quote) -> ManagedOrder:
+    def create_order(
+        self,
+        quote: Quote,
+        *,
+        post_only: bool = True,
+        tick_size: Decimal | None = None,
+        submission_key: str | None = None,
+    ) -> ManagedOrder:
         if self.dry_run:
             order = ManagedOrder(f"dry-{uuid4().hex[:12]}", quote, time())
             self._dry_orders[order.order_id] = order
             logger.info(
-                "DRY-RUN would post BUY %s shares @ %s (%s)",
+                "DRY-RUN would post %s %s shares @ %s (%s), post_only=%s",
+                quote.side.value,
                 quote.size,
                 quote.price,
                 quote.token_id,
+                post_only,
             )
             return order
         sdk = self._authenticated_sdk()
         from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions
-        from py_clob_client_v2.order_builder.constants import BUY
-        book = self.get_orderbook(quote.token_id)
-        result = sdk.create_and_post_order(
-            order_args=OrderArgs(
-                token_id=quote.token_id,
-                price=float(quote.price),
-                size=float(quote.size),
-                side=BUY,
-            ),
-            options=PartialCreateOrderOptions(
-                tick_size=str(book.tick_size), neg_risk=quote.neg_risk
-            ),
-            order_type=OrderType.GTC,
-            post_only=True,
+        from py_clob_client_v2.order_builder.constants import BUY, SELL
+        resolved_tick_size = tick_size or self.get_orderbook(quote.token_id).tick_size
+        order_args = OrderArgs(
+            token_id=quote.token_id,
+            price=float(quote.price),
+            size=float(quote.size),
+            side=BUY if quote.side == Side.BUY else SELL,
         )
+        options = PartialCreateOrderOptions(
+            tick_size=str(resolved_tick_size), neg_risk=quote.neg_risk
+        )
+        if submission_key:
+            # A POST can reach the CLOB even when its HTTP response is lost.
+            # Re-post the exact same signed order on retry so its order hash
+            # remains stable instead of reserving shares a second time.
+            prepared = self._prepared_orders.get(submission_key)
+            if prepared is None:
+                prepared = sdk.create_order(order_args=order_args, options=options)
+                self._prepared_orders[submission_key] = prepared
+            result = sdk.post_order(
+                prepared,
+                order_type=OrderType.GTC,
+                post_only=post_only,
+            )
+        else:
+            result = sdk.create_and_post_order(
+                order_args=order_args,
+                options=options,
+                order_type=OrderType.GTC,
+                post_only=post_only,
+            )
         if result.get("success") is False:
             raise RuntimeError(f"CLOB rejected order: {result.get('errorMsg') or result}")
         order_id = str(result.get("orderID") or result.get("order_id") or result.get("id") or "")
         if not order_id:
             raise RuntimeError(f"CLOB did not return an order ID: {result}")
+        if submission_key:
+            self._prepared_orders.pop(submission_key, None)
         return ManagedOrder(order_id, quote, time())
+
+    def create_orders_batch(
+        self,
+        quotes: list[tuple[Quote, Decimal]],
+        *,
+        post_only: bool = True,
+    ) -> list[ManagedOrder | Exception]:
+        """Sign and submit up to 15 independent market quotes in one request."""
+        if not quotes:
+            return []
+        if len(quotes) > MAX_ORDER_BATCH_SIZE:
+            raise ValueError(
+                f"A Polymarket order batch cannot exceed {MAX_ORDER_BATCH_SIZE} orders"
+            )
+        if self.dry_run:
+            return [
+                self.create_order(quote, post_only=post_only, tick_size=tick_size)
+                for quote, tick_size in quotes
+            ]
+
+        sdk = self._authenticated_sdk()
+        from py_clob_client_v2 import (
+            OrderArgs,
+            OrderType,
+            PartialCreateOrderOptions,
+            PostOrdersV2Args,
+        )
+        from py_clob_client_v2.order_builder.constants import BUY, SELL
+
+        prepared = []
+        for quote, tick_size in quotes:
+            signed_order = sdk.create_order(
+                order_args=OrderArgs(
+                    token_id=quote.token_id,
+                    price=float(quote.price),
+                    size=float(quote.size),
+                    side=BUY if quote.side == Side.BUY else SELL,
+                ),
+                options=PartialCreateOrderOptions(
+                    tick_size=str(tick_size),
+                    neg_risk=quote.neg_risk,
+                ),
+            )
+            prepared.append(
+                PostOrdersV2Args(order=signed_order, orderType=OrderType.GTC)
+            )
+
+        responses = sdk.post_orders(prepared, post_only=post_only)
+        if not isinstance(responses, list) or len(responses) != len(quotes):
+            raise RuntimeError(
+                "CLOB returned an invalid batch response: "
+                f"expected {len(quotes)} result(s)"
+            )
+
+        created_at = time()
+        results: list[ManagedOrder | Exception] = []
+        for (quote, _tick_size), response in zip(quotes, responses, strict=True):
+            if not isinstance(response, dict):
+                results.append(RuntimeError("CLOB returned an invalid order result"))
+                continue
+            error_message = response.get("errorMsg") or response.get("error")
+            if response.get("success") is False or error_message:
+                results.append(
+                    RuntimeError(f"CLOB rejected order: {error_message or response}")
+                )
+                continue
+            order_id = str(
+                response.get("orderID")
+                or response.get("order_id")
+                or response.get("id")
+                or ""
+            )
+            if not order_id:
+                results.append(
+                    RuntimeError(f"CLOB did not return an order ID: {response}")
+                )
+                continue
+            results.append(ManagedOrder(order_id, quote, created_at))
+        return results
+
+    def discard_prepared_order(self, submission_key: str) -> None:
+        self._prepared_orders.pop(submission_key, None)
+
+    def sync_conditional_allowance(self, token_id: str) -> None:
+        """Refresh CLOB's conditional-token balance cache before a SELL."""
+        if self.dry_run:
+            return
+        from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+
+        self._authenticated_sdk().update_balance_allowance(
+            BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+                signature_type=self.settings.signature_type,
+            )
+        )
+
+    def get_conditional_balance(self, token_id: str) -> Decimal:
+        """Return the currently available conditional-token shares."""
+        if self.dry_run:
+            return Decimal()
+        from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+
+        raw = self._authenticated_sdk().get_balance_allowance(
+            BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+                signature_type=self.settings.signature_type,
+            )
+        )
+        return Decimal(str(raw.get("balance") or "0")) / COLLATERAL_SCALE
 
     def cancel_order(self, order_id: str) -> None:
         if self.dry_run:
@@ -208,6 +351,41 @@ class PolymarketClient:
 
         params = OpenOrderParams(asset_id=token_id) if token_id else None
         return self._authenticated_sdk().get_open_orders(params)
+
+    def get_order_matched_shares(
+        self, order_id: str, token_id: str, created_at: float | None = None
+    ) -> Decimal:
+        """Recover an order's matched shares from authenticated trade history."""
+        if self.dry_run:
+            return Decimal()
+        from py_clob_client_v2 import TradeParams
+
+        after = max(0, int(created_at) - 60) if created_at is not None else None
+        trades = self._authenticated_sdk().get_trades(
+            TradeParams(asset_id=token_id, after=after), only_first_page=True
+        )
+        matched = Decimal()
+        seen_trade_ids: set[str] = set()
+        for trade in trades:
+            if not isinstance(trade, dict):
+                continue
+            status = str(trade.get("status") or "").upper()
+            if status.endswith("FAILED"):
+                continue
+            trade_id = str(trade.get("id") or "")
+            if trade_id and trade_id in seen_trade_ids:
+                continue
+            if trade_id:
+                seen_trade_ids.add(trade_id)
+            if str(trade.get("taker_order_id") or "") == order_id:
+                matched += Decimal(str(trade.get("size") or "0"))
+                continue
+            for maker_order in trade.get("maker_orders") or []:
+                if not isinstance(maker_order, dict):
+                    continue
+                if str(maker_order.get("order_id") or "") == order_id:
+                    matched += Decimal(str(maker_order.get("matched_amount") or "0"))
+        return matched
 
     def get_positions(self, condition_ids: list[str] | None = None) -> dict[str, Decimal]:
         if self.dry_run:
@@ -260,6 +438,10 @@ class PolymarketClient:
                     )
                 )
                 self.websocket_connected = True
+                logger.info(
+                    "User WebSocket connected for %d configured market(s)",
+                    len(condition_ids),
+                )
                 heartbeat = asyncio.create_task(self._user_ws_heartbeat(websocket))
                 try:
                     async for raw_message in websocket:
@@ -279,6 +461,8 @@ class PolymarketClient:
                     except asyncio.CancelledError:
                         pass
         finally:
+            if self.websocket_connected:
+                logger.info("User WebSocket connection closed")
             self.websocket_connected = False
 
     @staticmethod
@@ -316,7 +500,9 @@ class PolymarketClient:
             key=self.settings.private_key,
             signature_type=self.settings.signature_type,
             funder=self.funder_address(),
-            use_server_time=True,
+            # The VPS clock is NTP-synchronised. Asking /time before every L1/L2
+            # request doubles the network round trips on the hot path.
+            use_server_time=False,
         )
         credentials = credentials or base.create_or_derive_api_key()
         self._sdk = ClobClient(
@@ -326,7 +512,7 @@ class PolymarketClient:
             creds=credentials,
             signature_type=self.settings.signature_type,
             funder=self.funder_address(),
-            use_server_time=True,
+            use_server_time=False,
         )
         return self._sdk
 

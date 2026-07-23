@@ -13,14 +13,14 @@ WorkingDirectory=/opt/polymarket-mm-bot
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 EnvironmentFile=-/opt/polymarket-mm-bot/.env
-ExecStart=/opt/polymarket-mm-bot/.venv/bin/python -m poly_mm.web --config /opt/polymarket-mm-bot/config.toml --env /opt/polymarket-mm-bot/.env
+ExecStart=/opt/polymarket-mm-bot/.venv/bin/python -m poly_mm.web --config /var/lib/polymarket-mm-bot/config.toml --env /opt/polymarket-mm-bot/.env
 Restart=always
 RestartSec=10
 KillSignal=SIGTERM
 TimeoutStopSec=60
 UMask=0077
 
-# The process needs network access and write access only to its recovery state.
+# The process needs network access and write access only to its runtime state and account file.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

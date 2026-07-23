@@ -94,6 +94,8 @@ class _ConsoleHandler(BaseHTTPRequestHandler):
             self._send_static("styles.css", "text/css; charset=utf-8")
         elif path == "/static/app.js":
             self._send_static("app.js", "text/javascript; charset=utf-8")
+        elif path == "/static/polymarket-icon-white.png":
+            self._send_static("polymarket-icon-white.png", "image/png")
         elif path == "/api/status":
             try:
                 self._send_json(

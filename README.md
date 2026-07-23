@@ -16,14 +16,16 @@
 
 ## 已实现的实盘保护
 
-- 实盘启动前检查 VPS 出口 IP 的 Polymarket geoblock、EOA signer/funder、L2 凭据、
-  pUSD 余额和 CLOB allowance；任一失败都不下单。
+- 实盘启动前检查 VPS 出口 IP 的 Polymarket geoblock、EOA signer/funder、L2 凭据，
+  并读取 CLOB 返回的 pUSD 余额和 allowance；不自行合计跨市场挂单资金需求。
 - 所有订单使用 GTC、post-only，并使用订单簿返回的 tick size、最小订单量和
   neg-risk 属性。
 - User WebSocket 快速接收 order/trade 更新，同时持续用 REST 对账，避免 WebSocket
   断线导致漏报。
 - Data API 定期同步已有仓位；发现任何已有仓位或部分成交后，默认停止该 token 并
-  可靠撤销其剩余订单。
+  可靠撤销其剩余买单。机器人检测到自己 BUY 订单的新增成交份数后，会持久化卖出
+  意图、刷新 conditional-token allowance，并以 `$0.01` 提交同等份数的非 post-only
+  GTC 限价 SELL；份额尚未可用时会自动重试。这可能穿过价差并造成明显亏损。
 - 每次下单后原子写入权限为 `0600` 的恢复日志。实盘重启时默认先撤掉这个账户在所配
   token 上的全部订单，再确认订单列表为空，以覆盖“CLOB 已接单、进程尚未来得及写
   日志”这一崩溃窗口。
@@ -91,7 +93,7 @@ cp .env.example .env
 ```
 
 默认配置已经是 `dry_run = false`。第一笔实盘建议把 `quote_size`、
-`max_order_size`、`max_position_per_token` 和 `max_total_open_notional` 都维持在
+`max_order_size`、`max_position_per_token` 和 `max_total_open_shares` 都维持在
 交易所允许的最小值附近。
 
 ## 与 Predictfun 共用一台 VPS
@@ -111,13 +113,15 @@ cp .env.example .env
 
 ```bash
 sudo ./deploy/install-vps.sh
-sudo nano /opt/polymarket-mm-bot/config.toml
+sudo nano /var/lib/polymarket-mm-bot/config.toml
 sudo journalctl -u polymarket-mm-bot -f
 ```
 
 安装脚本会启动网页控制器，但不会自动启动交易引擎，因此不会因为安装而直接挂实盘
 订单。如果服务升级前有挂单任务在运行，脚本会先通过 SIGTERM 让旧进程撤单，再安装
-并重启网页控制器。常用命令：
+并重启网页控制器。网页可编辑的运行配置保存在
+`/var/lib/polymarket-mm-bot/config.toml`；首次升级时会自动从旧的
+`/opt/polymarket-mm-bot/config.toml` 复制，账户 `.env` 和已有设置不会被覆盖。常用命令：
 
 ```bash
 sudo systemctl status polymarket-mm-bot
@@ -143,11 +147,14 @@ ssh -N -L 8081:127.0.0.1:8081 your-user@your-vps
 实盘预检结果，并提供：
 
 - 在网页中保存 Private Key、钱包签名类型和 funder 地址；普通独立 EOA 选择类型
-  `0` 并让 funder 留空；
+  `0` 并让 funder 留空；如果 Polymarket 右上角显示的资金地址与该 EOA 不同，必须
+  改用对应的 Proxy、Safe 或 Deposit Wallet 类型，并把网页显示的完整地址作为 funder；
 - 保存时在 VPS 内存中校验私钥，并通过官方 SDK `create_or_derive_api_key()` 自动派生
   L2 API key、secret 和 passphrase；页面和状态 API 只返回“是否已配置”，从不回显
   私钥或 L2 secret；
 - 单独运行不会下单的实盘预检；
+  预检只展示 Polymarket 返回的余额和 allowance，不把多个市场的 BUY 名义金额相加；
+  每笔订单是否接受以 CLOB 下单接口的实际返回为准，并原样记录拒单原因；
 - 明确启动或停止挂单任务；网页服务本身重启后不会自动恢复实盘任务；
 - 默认不设置有效期；在“挂单设置”中勾选后，可通过“小时”和“分钟”下拉框设置
   1 分钟至 7 天的挂单任务有效期，每次启动时重新倒计时；
@@ -156,7 +163,8 @@ ssh -N -L 8081:127.0.0.1:8081 your-user@your-vps
 - 恢复报价。
 - 查看最多 300 行经过敏感信息脱敏的内存运行日志；复制或选择日志文字时会暂停刷新。
 
-有效期到期后如需重新挂单，请再次启动任务，新的有效期会从本次启动时重新计算。
+每次点击“启动挂单任务”都会清除上一轮的暂停/过期状态，并从本次启动时间重新计算
+有效期；不会继承恢复日志中的旧截止时间。
 
 账户文件由独立的 `polymm` 用户持有且权限为 `0600`。页面和状态 API 不返回私钥、
 API secret 或 passphrase，服务日志也不会记录提交内容。控制操作仍要求同源自定义
@@ -173,13 +181,25 @@ SSH 隧道访问。
 `market_slug`。关键运行参数：
 
 - `preflight_enabled`：实盘启动保护，不建议关闭。
-- `websocket_enabled`：启用用户订单/成交实时事件；REST 对账不会因此关闭。
-- `position_poll_interval_seconds`：已有仓位同步间隔。
+- `websocket_enabled`：启用独立的用户订单/成交实时消费者；事件不等待挂单循环。
+- `position_poll_interval_seconds`：常规仓位同步间隔；存在活动 BUY 时自动缩短至最多
+  1 秒，同时订单 REST 对账自动缩短至最多 0.5 秒。
+- 同一轮常规 BUY 报价通过官方 `/orders` 批量接口提交，每批最多 15 笔；不同市场
+  按 Polymarket 的 per-market 余额规则共享账户余额。保护 SELL 仍使用独立单笔接口。
+- `min_spread` 和 `max_spread` 以 `$0.01` tick 为标准单位；当盘口 tick 为
+  `$0.001` 时，价差阈值自动缩小到十分之一，并继续按实际 tick 计算挂单价格。
+- 默认 BUY 报价位于当前最佳买价之后两个实际 tick；`$0.001` 市场后退
+  `$0.002`，`$0.01` 市场后退 `$0.02`。
 - `cancel_after_seconds`：单笔挂单多少秒后撤销并等待下一轮重挂。
 - `cancel_retry_count` / `cancel_retry_base_seconds`：可靠撤单重试。
 - `console_enabled` / `console_host` / `console_port`：本机控制台；host 必须是
   loopback 地址，默认 `127.0.0.1:8081`。
 - `halt_on_fill`：任何部分成交或已有仓位出现后停止该 token。
+- `sell_on_fill`：机器人 BUY 单部分或全部成交后，以非 post-only GTC 限价单卖出新增
+  成交份数；tick 为 `$0.001` 时保护价使用 `$0.001`，否则使用 `$0.01`。默认开启，
+  可能立即吃掉买盘并产生明显亏损。
+- 连续收到 `invalid token id` 的保护卖单会先核验真实持仓：零持仓才归档；仍有持仓
+  则暂停挂单并保留恢复记录，避免无限重试或静默遗留仓位。
 - `cancel_all_on_start`：启动时撤销配置 token 的账户订单并确认清空。
 - `cancel_all_on_shutdown`：SIGTERM/SIGINT 时撤销所有跟踪订单。
 

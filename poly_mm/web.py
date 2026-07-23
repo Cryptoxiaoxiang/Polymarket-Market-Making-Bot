@@ -137,8 +137,9 @@ class DashboardController:
             "run_duration_seconds": config.run_duration_seconds,
             "max_order_size": str(config.risk.max_order_size),
             "max_position_per_token": str(config.risk.max_position_per_token),
-            "max_total_open_notional": str(config.risk.max_total_open_notional),
+            "max_total_open_shares": str(config.risk.max_total_open_shares),
             "halt_on_fill": config.halt_on_fill,
+            "sell_on_fill": config.sell_on_fill,
             "markets": [
                 {
                     "url": market.url,
@@ -334,10 +335,13 @@ class DashboardController:
                 _positive_decimal(payload.get("cancel_after_seconds"), "撤单等待秒数")
             )
             max_position = _positive_decimal(
-                payload.get("max_position_per_token"), "单 outcome 最大仓位"
+                payload.get("max_position_per_token"), "单选项最大仓位"
             )
-            max_notional = _positive_decimal(
-                payload.get("max_total_open_notional"), "总开放名义金额"
+            max_total_open_shares = _positive_decimal(
+                payload.get(
+                    "max_total_open_shares", payload.get("max_total_open_notional")
+                ),
+                "总最大仓位",
             )
             duration_enabled = payload.get("run_duration_enabled") is True
             hours = _bounded_int(payload.get("run_duration_hours", 0), "有效期小时", 0, 168)
@@ -351,6 +355,11 @@ class DashboardController:
             updated = replace(
                 current,
                 dry_run=payload.get("dry_run") is True,
+                sell_on_fill=(
+                    payload.get("sell_on_fill") is True
+                    if "sell_on_fill" in payload
+                    else current.sell_on_fill
+                ),
                 cancel_after_seconds=cancel_after_seconds,
                 run_duration_seconds=run_duration_seconds,
                 markets=markets,
@@ -359,7 +368,7 @@ class DashboardController:
                     current.risk,
                     max_order_size=maximum_quote_size,
                     max_position_per_token=max_position,
-                    max_total_open_notional=max_notional,
+                    max_total_open_shares=max_total_open_shares,
                 ),
             )
             write_config(self.config_path, updated)

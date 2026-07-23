@@ -28,3 +28,67 @@ def test_quote_settings_replace_misleading_read_only_summary() -> None:
     assert "风险与刷新" not in html
     assert "fetch('/api/resolve-market'" in javascript
     assert "action('/api/setup'" in javascript
+
+
+def test_web_actions_only_disable_the_button_that_triggered_them() -> None:
+    static_dir = Path(__file__).parents[1] / "poly_mm" / "web_static"
+    javascript = (static_dir / "app.js").read_text(encoding="utf-8")
+
+    assert "document.querySelectorAll('button').forEach((button) => { button.disabled = true; });" not in javascript
+    assert "if (trigger) trigger.disabled = true;" in javascript
+    assert "if (trigger) trigger.disabled = false;" in javascript
+
+
+def test_start_quote_task_does_not_show_confirmation_dialog() -> None:
+    static_dir = Path(__file__).parents[1] / "poly_mm" / "web_static"
+    javascript = (static_dir / "app.js").read_text(encoding="utf-8")
+
+    assert (
+        "action('/api/start', { trigger: event.currentTarget })" in javascript
+    )
+    assert "确认启动挂单任务" not in javascript
+
+
+def test_dashboard_uses_confirmed_modern_empty_state_without_market_module() -> None:
+    static_dir = Path(__file__).parents[1] / "poly_mm" / "web_static"
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    javascript = (static_dir / "app.js").read_text(encoding="utf-8")
+
+    assert "做市控制台" in html
+    assert 'id="open-orders-empty"' in html
+    assert "尚未创建挂单任务" in html
+    assert "市场与仓位" not in html
+    assert 'id="markets-list"' not in html
+    assert "byId('markets-list')" not in javascript
+    assert 'href="https://x.com/cryptoxiaoxiang"' in html
+    assert "@cryptoxiaoxiang" in html
+
+
+def test_dashboard_shows_wallet_balance_and_quote_expiry_countdown() -> None:
+    static_dir = Path(__file__).parents[1] / "poly_mm" / "web_static"
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    javascript = (static_dir / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="wallet-balance-value"' in html
+    assert 'id="expiry-countdown-value"' in html
+    assert 'id="total-position-value"' not in html
+    assert "preflight?.collateral_balance" in javascript
+    assert "updateExpiryMetric(status)" in javascript
+    assert "updateExpiryMetric(); }, 1000" in javascript
+
+
+def test_sidebar_uses_official_polymarket_icon_asset() -> None:
+    static_dir = Path(__file__).parents[1] / "poly_mm" / "web_static"
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
+
+    assert 'src="/static/polymarket-icon-white.png"' in html
+    assert (static_dir / "polymarket-icon-white.png").is_file()
+    assert '<div class="brand-logo">P</div>' not in html
+
+
+def test_account_setup_explains_proxy_funder_address() -> None:
+    static_dir = Path(__file__).parents[1] / "poly_mm" / "web_static"
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
+
+    assert "只有资金直接位于 EOA 地址时才选 0" in html
+    assert "Polymarket 右上角地址与私钥 EOA 地址不同" in html
