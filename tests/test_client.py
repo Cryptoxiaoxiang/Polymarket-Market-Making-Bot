@@ -108,6 +108,24 @@ def test_submission_retry_reuses_the_same_signed_order() -> None:
     assert client._prepared_orders == {}
 
 
+@patch("py_clob_client_v2.ClobClient")
+def test_authenticated_client_uses_ntp_synced_local_time(mock_client: Mock) -> None:
+    credential_client = Mock()
+    credential_client.create_or_derive_api_key.return_value = Mock()
+    authenticated_client = Mock()
+    mock_client.side_effect = [credential_client, authenticated_client]
+    client = PolymarketClient(
+        Settings(private_key="0x" + "1" * 64),
+        dry_run=False,
+    )
+
+    assert client._authenticated_sdk() is authenticated_client
+    assert mock_client.call_count == 2
+    assert all(
+        call.kwargs["use_server_time"] is False for call in mock_client.call_args_list
+    )
+
+
 def test_order_matched_shares_is_recovered_from_taker_and_maker_trades() -> None:
     sdk = Mock()
     sdk.get_trades.return_value = [

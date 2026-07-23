@@ -1,13 +1,13 @@
 import asyncio
 from decimal import Decimal
-from threading import Event
+from threading import Event, Lock
 from time import time
 from types import SimpleNamespace
 
 from poly_mm.config import BotConfig, MarketConfig
 from poly_mm.engine import MarketMakerEngine
 from poly_mm.journal import OrderJournal
-from poly_mm.models import ExitIntent, ManagedOrder, Quote, Side
+from poly_mm.models import ExitIntent, Level, ManagedOrder, OrderBook, Quote, Side
 
 
 class FakeClient:
@@ -108,6 +108,43 @@ def test_unknown_rest_status_retains_order_for_safety(tmp_path) -> None:
     asyncio.run(engine._reconcile_orders())
 
     assert "order-1" in engine.orders
+
+
+def test_reconciliation_reads_independent_order_states_concurrently(tmp_path) -> None:
+    class ConcurrentReconcileClient(FakeClient):
+        def __init__(self, journal_path) -> None:
+            super().__init__(journal_path)
+            self.lock = Lock()
+            self.read_count = 0
+            self.reads_started = Event()
+
+        def get_order(self, order_id: str) -> dict:
+            with self.lock:
+                self.read_count += 1
+                if self.read_count == 2:
+                    self.reads_started.set()
+            if not self.reads_started.wait(1):
+                raise RuntimeError("order states were read serially")
+            return {
+                "id": order_id,
+                "status": "ORDER_STATUS_LIVE",
+                "size_matched": "0",
+            }
+
+    client = ConcurrentReconcileClient(tmp_path / "orders.json")
+    engine = MarketMakerEngine(_config(), client)
+    first = _order()
+    second = ManagedOrder(
+        "order-2",
+        Quote("token-2", Side.BUY, Decimal("0.42"), Decimal("5")),
+        1_700_000_000,
+    )
+    engine.orders = {first.order_id: first, second.order_id: second}
+
+    asyncio.run(engine._reconcile_orders())
+
+    assert client.read_count == 2
+    assert set(engine.orders) == {"order-1", "order-2"}
 
 
 def test_rest_error_requires_repeated_trade_confirmation_before_removal(tmp_path) -> None:
@@ -236,6 +273,65 @@ def test_websocket_partial_fill_halts_token_and_cancels_order(tmp_path) -> None:
     assert client.cancelled == ["order-1"]
     assert engine.orders == {}
     assert OrderJournal(tmp_path / "orders.json").load() == []
+
+
+def test_tick_fetches_books_and_submits_independent_quotes_concurrently(tmp_path) -> None:
+    class ConcurrentQuoteClient(FakeClient):
+        def __init__(self, journal_path) -> None:
+            super().__init__(journal_path)
+            self.lock = Lock()
+            self.book_count = 0
+            self.submit_count = 0
+            self.books_started = Event()
+            self.submissions_started = Event()
+
+        def get_orderbook(self, token_id: str) -> OrderBook:
+            with self.lock:
+                self.book_count += 1
+                if self.book_count == 2:
+                    self.books_started.set()
+            if not self.books_started.wait(1):
+                raise RuntimeError("order books were fetched serially")
+            return OrderBook(
+                token_id,
+                [Level(Decimal("0.40"), Decimal("100"))],
+                [Level(Decimal("0.45"), Decimal("100"))],
+                Decimal("0.01"),
+                Decimal("5"),
+            )
+
+        def create_order(
+            self,
+            quote: Quote,
+            *,
+            post_only: bool = True,
+            tick_size: Decimal | None = None,
+            submission_key: str | None = None,
+        ) -> ManagedOrder:
+            with self.lock:
+                self.submit_count += 1
+                if self.submit_count == 2:
+                    self.submissions_started.set()
+            if not self.submissions_started.wait(1):
+                raise RuntimeError("quotes were submitted serially")
+            return ManagedOrder(f"order-{quote.token_id}", quote, time())
+
+    client = ConcurrentQuoteClient(tmp_path / "orders.json")
+    engine = MarketMakerEngine(
+        BotConfig(
+            markets=[
+                MarketConfig(token_id="token-1", condition_id="condition-1"),
+                MarketConfig(token_id="token-2", condition_id="condition-2"),
+            ]
+        ),
+        client,
+    )
+
+    asyncio.run(engine._tick())
+
+    assert client.book_count == 2
+    assert client.submit_count == 2
+    assert set(engine.orders) == {"order-token-1", "order-token-2"}
 
 
 def test_buy_fill_submits_same_size_sell_at_one_cent(tmp_path) -> None:

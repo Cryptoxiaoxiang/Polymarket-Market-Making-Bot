@@ -414,7 +414,9 @@ class PolymarketClient:
             key=self.settings.private_key,
             signature_type=self.settings.signature_type,
             funder=self.funder_address(),
-            use_server_time=True,
+            # The VPS clock is NTP-synchronised. Asking /time before every L1/L2
+            # request doubles the network round trips on the hot path.
+            use_server_time=False,
         )
         credentials = credentials or base.create_or_derive_api_key()
         self._sdk = ClobClient(
@@ -424,7 +426,7 @@ class PolymarketClient:
             creds=credentials,
             signature_type=self.settings.signature_type,
             funder=self.funder_address(),
-            use_server_time=True,
+            use_server_time=False,
         )
         return self._sdk
 
