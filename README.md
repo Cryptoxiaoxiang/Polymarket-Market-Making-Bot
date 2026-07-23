@@ -184,6 +184,8 @@ SSH 隧道访问。
 - `websocket_enabled`：启用独立的用户订单/成交实时消费者；事件不等待挂单循环。
 - `position_poll_interval_seconds`：常规仓位同步间隔；存在活动 BUY 时自动缩短至最多
   1 秒，同时订单 REST 对账自动缩短至最多 0.5 秒。
+- 同一轮常规 BUY 报价通过官方 `/orders` 批量接口提交，每批最多 15 笔；不同市场
+  按 Polymarket 的 per-market 余额规则共享账户余额。保护 SELL 仍使用独立单笔接口。
 - `cancel_after_seconds`：单笔挂单多少秒后撤销并等待下一轮重挂。
 - `cancel_retry_count` / `cancel_retry_base_seconds`：可靠撤单重试。
 - `console_enabled` / `console_host` / `console_port`：本机控制台；host 必须是

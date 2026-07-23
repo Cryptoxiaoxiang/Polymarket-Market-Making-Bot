@@ -3,7 +3,7 @@ from unittest.mock import Mock, patch
 
 from poly_mm.client import PolymarketClient
 from poly_mm.config import Settings
-from poly_mm.models import Level, OrderBook, Quote, Side
+from poly_mm.models import Level, ManagedOrder, OrderBook, Quote, Side
 
 
 @patch("poly_mm.client.requests.get")
@@ -68,6 +68,43 @@ def test_cached_tick_size_skips_orderbook_request() -> None:
     options = sdk.create_and_post_order.call_args.kwargs["options"]
     assert options.tick_size == "0.01"
     client.get_orderbook.assert_not_called()
+
+
+def test_batch_orders_are_signed_and_posted_in_one_request() -> None:
+    sdk = Mock()
+    sdk.create_order.side_effect = ["signed-1", "signed-2"]
+    sdk.post_orders.return_value = [
+        {"success": True, "orderID": "order-1"},
+        {
+            "success": False,
+            "errorMsg": "not enough balance / allowance",
+        },
+    ]
+    client = PolymarketClient(Settings(private_key="0x" + "1" * 64), dry_run=False)
+    client._sdk = sdk
+    quotes = [
+        (
+            Quote("token-1", Side.BUY, Decimal("0.20"), Decimal("100")),
+            Decimal("0.01"),
+        ),
+        (
+            Quote("token-2", Side.BUY, Decimal("0.30"), Decimal("100")),
+            Decimal("0.001"),
+        ),
+    ]
+
+    results = client.create_orders_batch(quotes)
+
+    assert sdk.create_order.call_count == 2
+    assert sdk.post_orders.call_count == 1
+    post_args = sdk.post_orders.call_args
+    assert [item.order for item in post_args.args[0]] == ["signed-1", "signed-2"]
+    assert post_args.kwargs["post_only"] is True
+    assert isinstance(results[0], ManagedOrder)
+    assert results[0].order_id == "order-1"
+    assert results[0].quote == quotes[0][0]
+    assert isinstance(results[1], RuntimeError)
+    assert "not enough balance / allowance" in str(results[1])
 
 
 def test_submission_retry_reuses_the_same_signed_order() -> None:

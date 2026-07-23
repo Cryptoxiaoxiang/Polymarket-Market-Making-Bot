@@ -7,7 +7,7 @@ from dataclasses import replace
 from decimal import ROUND_DOWN, Decimal
 from time import monotonic, time
 
-from poly_mm.client import PolymarketClient
+from poly_mm.client import MAX_ORDER_BATCH_SIZE, PolymarketClient
 from poly_mm.config import BotConfig
 from poly_mm.journal import OrderJournal
 from poly_mm.models import ExitIntent, ManagedOrder, Quote, Side
@@ -243,31 +243,65 @@ class MarketMakerEngine:
                 # Reserve risk capacity before concurrent submissions begin.
                 active.append(ManagedOrder(f"pending:{market.token_id}", quote, time()))
 
-        async def submit_quote(market, quote, tick_size):
-            try:
-                order = await asyncio.to_thread(
-                    self.client.create_order, quote, tick_size=tick_size
-                )
-                return market, order, None
-            except Exception as error:  # keep other markets operating
-                return market, None, error
-
         batch_started = monotonic()
-        tasks = [
-            asyncio.create_task(submit_quote(market, quote, tick_size))
-            for market, quote, tick_size in proposals
-        ]
         submitted = 0
-        for task in asyncio.as_completed(tasks):
-            market, order, error = await task
-            if error is not None:
-                logger.warning(
-                    "Skip %s this cycle: %s", market.label or market.token_id, error
+        batch_submitter = getattr(self.client, "create_orders_batch", None)
+        if callable(batch_submitter):
+            for offset in range(0, len(proposals), MAX_ORDER_BATCH_SIZE):
+                chunk = proposals[offset : offset + MAX_ORDER_BATCH_SIZE]
+                logger.info(
+                    "Submitting %d quote(s) through the CLOB batch endpoint",
+                    len(chunk),
                 )
-                continue
-            self.orders[order.order_id] = order
-            self._persist_orders()
-            submitted += 1
+                try:
+                    results = await asyncio.to_thread(
+                        batch_submitter,
+                        [(quote, tick_size) for _market, quote, tick_size in chunk],
+                    )
+                except Exception as error:
+                    results = [error] * len(chunk)
+                chunk_submitted = 0
+                for (market, _quote, _tick_size), result in zip(
+                    chunk, results, strict=True
+                ):
+                    if isinstance(result, Exception):
+                        logger.warning(
+                            "Skip %s this cycle: %s",
+                            market.label or market.token_id,
+                            result,
+                        )
+                        continue
+                    self.orders[result.order_id] = result
+                    submitted += 1
+                    chunk_submitted += 1
+                if chunk_submitted:
+                    self._persist_orders()
+        else:
+            async def submit_quote(market, quote, tick_size):
+                try:
+                    order = await asyncio.to_thread(
+                        self.client.create_order, quote, tick_size=tick_size
+                    )
+                    return market, order, None
+                except Exception as error:  # keep other markets operating
+                    return market, None, error
+
+            tasks = [
+                asyncio.create_task(submit_quote(market, quote, tick_size))
+                for market, quote, tick_size in proposals
+            ]
+            for task in asyncio.as_completed(tasks):
+                market, order, error = await task
+                if error is not None:
+                    logger.warning(
+                        "Skip %s this cycle: %s",
+                        market.label or market.token_id,
+                        error,
+                    )
+                    continue
+                self.orders[order.order_id] = order
+                self._persist_orders()
+                submitted += 1
         if proposals:
             logger.info(
                 "Quote batch submitted %d/%d order(s) in %.0fms",

@@ -14,6 +14,7 @@ from poly_mm.models import Level, ManagedOrder, OrderBook, PreflightReport, Quot
 
 logger = logging.getLogger("poly-mm")
 COLLATERAL_SCALE = Decimal(10**6)
+MAX_ORDER_BATCH_SIZE = 15
 # Polymarket documents Japan as restricted in its frontend UI only; CLOB API
 # trading is not restricted there. The geoblock endpoint still reports the IP
 # as blocked, so preflight must distinguish it from API-blocked jurisdictions.
@@ -199,6 +200,85 @@ class PolymarketClient:
         if submission_key:
             self._prepared_orders.pop(submission_key, None)
         return ManagedOrder(order_id, quote, time())
+
+    def create_orders_batch(
+        self,
+        quotes: list[tuple[Quote, Decimal]],
+        *,
+        post_only: bool = True,
+    ) -> list[ManagedOrder | Exception]:
+        """Sign and submit up to 15 independent market quotes in one request."""
+        if not quotes:
+            return []
+        if len(quotes) > MAX_ORDER_BATCH_SIZE:
+            raise ValueError(
+                f"A Polymarket order batch cannot exceed {MAX_ORDER_BATCH_SIZE} orders"
+            )
+        if self.dry_run:
+            return [
+                self.create_order(quote, post_only=post_only, tick_size=tick_size)
+                for quote, tick_size in quotes
+            ]
+
+        sdk = self._authenticated_sdk()
+        from py_clob_client_v2 import (
+            OrderArgs,
+            OrderType,
+            PartialCreateOrderOptions,
+            PostOrdersV2Args,
+        )
+        from py_clob_client_v2.order_builder.constants import BUY, SELL
+
+        prepared = []
+        for quote, tick_size in quotes:
+            signed_order = sdk.create_order(
+                order_args=OrderArgs(
+                    token_id=quote.token_id,
+                    price=float(quote.price),
+                    size=float(quote.size),
+                    side=BUY if quote.side == Side.BUY else SELL,
+                ),
+                options=PartialCreateOrderOptions(
+                    tick_size=str(tick_size),
+                    neg_risk=quote.neg_risk,
+                ),
+            )
+            prepared.append(
+                PostOrdersV2Args(order=signed_order, orderType=OrderType.GTC)
+            )
+
+        responses = sdk.post_orders(prepared, post_only=post_only)
+        if not isinstance(responses, list) or len(responses) != len(quotes):
+            raise RuntimeError(
+                "CLOB returned an invalid batch response: "
+                f"expected {len(quotes)} result(s)"
+            )
+
+        created_at = time()
+        results: list[ManagedOrder | Exception] = []
+        for (quote, _tick_size), response in zip(quotes, responses, strict=True):
+            if not isinstance(response, dict):
+                results.append(RuntimeError("CLOB returned an invalid order result"))
+                continue
+            error_message = response.get("errorMsg") or response.get("error")
+            if response.get("success") is False or error_message:
+                results.append(
+                    RuntimeError(f"CLOB rejected order: {error_message or response}")
+                )
+                continue
+            order_id = str(
+                response.get("orderID")
+                or response.get("order_id")
+                or response.get("id")
+                or ""
+            )
+            if not order_id:
+                results.append(
+                    RuntimeError(f"CLOB did not return an order ID: {response}")
+                )
+                continue
+            results.append(ManagedOrder(order_id, quote, created_at))
+        return results
 
     def discard_prepared_order(self, submission_key: str) -> None:
         self._prepared_orders.pop(submission_key, None)

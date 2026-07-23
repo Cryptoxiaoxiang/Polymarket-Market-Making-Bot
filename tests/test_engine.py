@@ -337,15 +337,14 @@ def test_active_buy_orders_use_fast_reconciliation_intervals(tmp_path) -> None:
     assert engine._current_position_interval() == 1
 
 
-def test_tick_fetches_books_and_submits_independent_quotes_concurrently(tmp_path) -> None:
-    class ConcurrentQuoteClient(FakeClient):
+def test_tick_fetches_books_concurrently_and_submits_one_quote_batch(tmp_path) -> None:
+    class BatchQuoteClient(FakeClient):
         def __init__(self, journal_path) -> None:
             super().__init__(journal_path)
             self.lock = Lock()
             self.book_count = 0
-            self.submit_count = 0
             self.books_started = Event()
-            self.submissions_started = Event()
+            self.batches: list[list[tuple[Quote, Decimal]]] = []
 
         def get_orderbook(self, token_id: str) -> OrderBook:
             with self.lock:
@@ -362,23 +361,20 @@ def test_tick_fetches_books_and_submits_independent_quotes_concurrently(tmp_path
                 Decimal("5"),
             )
 
-        def create_order(
+        def create_orders_batch(
             self,
-            quote: Quote,
+            quotes: list[tuple[Quote, Decimal]],
             *,
             post_only: bool = True,
-            tick_size: Decimal | None = None,
-            submission_key: str | None = None,
-        ) -> ManagedOrder:
-            with self.lock:
-                self.submit_count += 1
-                if self.submit_count == 2:
-                    self.submissions_started.set()
-            if not self.submissions_started.wait(1):
-                raise RuntimeError("quotes were submitted serially")
-            return ManagedOrder(f"order-{quote.token_id}", quote, time())
+        ) -> list[ManagedOrder | Exception]:
+            self.batches.append(quotes)
+            assert post_only is True
+            return [
+                ManagedOrder(f"order-{quote.token_id}", quote, time())
+                for quote, _tick_size in quotes
+            ]
 
-    client = ConcurrentQuoteClient(tmp_path / "orders.json")
+    client = BatchQuoteClient(tmp_path / "orders.json")
     engine = MarketMakerEngine(
         BotConfig(
             markets=[
@@ -392,8 +388,55 @@ def test_tick_fetches_books_and_submits_independent_quotes_concurrently(tmp_path
     asyncio.run(engine._tick())
 
     assert client.book_count == 2
-    assert client.submit_count == 2
+    assert len(client.batches) == 1
+    assert [quote.token_id for quote, _tick_size in client.batches[0]] == [
+        "token-1",
+        "token-2",
+    ]
     assert set(engine.orders) == {"order-token-1", "order-token-2"}
+
+
+def test_quote_batch_keeps_successes_when_an_individual_order_is_rejected(
+    tmp_path,
+) -> None:
+    class PartialBatchClient(FakeClient):
+        def get_orderbook(self, token_id: str) -> OrderBook:
+            return OrderBook(
+                token_id,
+                [Level(Decimal("0.40"), Decimal("100"))],
+                [Level(Decimal("0.45"), Decimal("100"))],
+                Decimal("0.01"),
+                Decimal("5"),
+            )
+
+        def create_orders_batch(
+            self,
+            quotes: list[tuple[Quote, Decimal]],
+            *,
+            post_only: bool = True,
+        ) -> list[ManagedOrder | Exception]:
+            assert post_only is True
+            return [
+                ManagedOrder("order-token-1", quotes[0][0], time()),
+                RuntimeError("not enough balance / allowance"),
+            ]
+
+    client = PartialBatchClient(tmp_path / "orders.json")
+    engine = MarketMakerEngine(
+        BotConfig(
+            markets=[
+                MarketConfig(token_id="token-1", condition_id="condition-1"),
+                MarketConfig(token_id="token-2", condition_id="condition-2"),
+            ]
+        ),
+        client,
+    )
+
+    asyncio.run(engine._tick())
+
+    assert set(engine.orders) == {"order-token-1"}
+    restored = OrderJournal(tmp_path / "orders.json").load()
+    assert [order.order_id for order in restored] == ["order-token-1"]
 
 
 def test_buy_fill_submits_same_size_sell_at_one_cent(tmp_path) -> None:
