@@ -337,6 +337,105 @@ def test_active_buy_orders_use_fast_reconciliation_intervals(tmp_path) -> None:
     assert engine._current_position_interval() == 1
 
 
+def test_best_bid_moving_toward_live_buy_cancels_before_lifetime(tmp_path) -> None:
+    class MonitoringClient(FakeClient):
+        def get_orderbook(self, token_id: str) -> OrderBook:
+            return OrderBook(
+                token_id,
+                [Level(Decimal("0.43"), Decimal("100"))],
+                [Level(Decimal("0.50"), Decimal("100"))],
+                Decimal("0.01"),
+                Decimal("5"),
+            )
+
+    client = MonitoringClient(tmp_path / "orders.json")
+    client.open_orders = [{"id": "order-1"}]
+    engine = MarketMakerEngine(
+        BotConfig(
+            cancel_after_seconds=60,
+            cancel_retry_base_seconds=0,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+    )
+    order = ManagedOrder(
+        "order-1",
+        Quote("token-1", Side.BUY, Decimal("0.42"), Decimal("5")),
+        time(),
+    )
+    engine.orders = {order.order_id: order}
+
+    asyncio.run(engine._cancel_stale())
+
+    assert client.cancelled == ["order-1"]
+    assert engine.orders == {}
+    assert engine.latest_books["token-1"]["best_bid"] == "0.43"
+
+
+def test_live_buy_stays_when_best_bid_distance_is_unchanged_or_wider(tmp_path) -> None:
+    class MonitoringClient(FakeClient):
+        def __init__(self, journal_path) -> None:
+            super().__init__(journal_path)
+            self.best_bid = Decimal("0.44")
+
+        def get_orderbook(self, token_id: str) -> OrderBook:
+            return OrderBook(
+                token_id,
+                [Level(self.best_bid, Decimal("100"))],
+                [Level(Decimal("0.50"), Decimal("100"))],
+                Decimal("0.01"),
+                Decimal("5"),
+            )
+
+    client = MonitoringClient(tmp_path / "orders.json")
+    client.open_orders = [{"id": "order-1"}]
+    engine = MarketMakerEngine(
+        BotConfig(
+            cancel_after_seconds=60,
+            cancel_retry_base_seconds=0,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+    )
+    order = ManagedOrder(
+        "order-1",
+        Quote("token-1", Side.BUY, Decimal("0.42"), Decimal("5")),
+        time(),
+    )
+    engine.orders = {order.order_id: order}
+
+    asyncio.run(engine._cancel_stale())
+    client.best_bid = Decimal("0.45")
+    asyncio.run(engine._cancel_stale())
+
+    assert client.cancelled == []
+    assert set(engine.orders) == {"order-1"}
+
+
+def test_buy_still_cancels_at_lifetime_without_book_monitoring(tmp_path) -> None:
+    client = FakeClient(tmp_path / "orders.json")
+    client.open_orders = [{"id": "order-1"}]
+    engine = MarketMakerEngine(
+        BotConfig(
+            cancel_after_seconds=60,
+            cancel_retry_base_seconds=0,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+    )
+    order = ManagedOrder(
+        "order-1",
+        Quote("token-1", Side.BUY, Decimal("0.42"), Decimal("5")),
+        time() - 61,
+    )
+    engine.orders = {order.order_id: order}
+
+    asyncio.run(engine._cancel_stale())
+
+    assert client.cancelled == ["order-1"]
+    assert engine.orders == {}
+
+
 def test_tick_fetches_books_concurrently_and_submits_one_quote_batch(tmp_path) -> None:
     class BatchQuoteClient(FakeClient):
         def __init__(self, journal_path) -> None:

@@ -10,7 +10,7 @@ from time import monotonic, time
 from poly_mm.client import MAX_ORDER_BATCH_SIZE, PolymarketClient
 from poly_mm.config import BotConfig
 from poly_mm.journal import OrderJournal
-from poly_mm.models import ExitIntent, ManagedOrder, Quote, Side
+from poly_mm.models import ExitIntent, ManagedOrder, OrderBook, Quote, Side
 from poly_mm.risk import RiskManager
 from poly_mm.strategy import PassiveMakerStrategy
 
@@ -230,13 +230,7 @@ class MarketMakerEngine:
                     "Skip %s this cycle: %s", market.label or market.token_id, book
                 )
                 continue
-            self.latest_books[market.token_id] = {
-                "best_bid": str(book.best_bid.price) if book.best_bid else "",
-                "best_ask": str(book.best_ask.price) if book.best_ask else "",
-                "spread": str(book.spread) if book.spread is not None else "",
-                "tick_size": str(book.tick_size),
-                "neg_risk": book.neg_risk,
-            }
+            self._remember_book(book)
             quote = self.strategy.build_quote(market, book)
             if quote and self.risk.approve(quote, active, self.positions):
                 proposals.append((market, quote, book.tick_size))
@@ -500,19 +494,80 @@ class MarketMakerEngine:
         return True
 
     async def _cancel_stale(self) -> None:
-        stale_tokens = []
+        stale_tokens: list[str] = []
+        monitored_orders: dict[str, list[ManagedOrder]] = {}
         for order in list(self.orders.values()):
             # A protective fill exit must remain open until it fills or the
             # operator explicitly pauses/stops the task.
             if order.quote.side == Side.SELL:
                 continue
-            if order.age_seconds < self.config.cancel_after_seconds:
+            if order.age_seconds >= self.config.cancel_after_seconds:
+                if order.quote.token_id not in stale_tokens:
+                    stale_tokens.append(order.quote.token_id)
                 continue
-            if order.quote.token_id not in stale_tokens:
-                stale_tokens.append(order.quote.token_id)
+            monitored_orders.setdefault(order.quote.token_id, []).append(order)
+
+        monitored_tokens = [
+            token_id for token_id in monitored_orders if token_id not in stale_tokens
+        ]
+        books = await asyncio.gather(
+            *(
+                asyncio.to_thread(self.client.get_orderbook, token_id)
+                for token_id in monitored_tokens
+            ),
+            return_exceptions=True,
+        )
+        for token_id, book in zip(monitored_tokens, books, strict=True):
+            if isinstance(book, BaseException):
+                logger.warning(
+                    "Unable to monitor best-bid distance for %s: %s",
+                    token_id,
+                    book,
+                )
+                continue
+            self._remember_book(book)
+            for order in monitored_orders[token_id]:
+                if not self._best_bid_distance_shrank(order, book):
+                    continue
+                distance_ticks = (book.best_bid.price - order.quote.price) / book.tick_size
+                logger.warning(
+                    "Best-bid distance shrank to %s tick(s) for %s; "
+                    "canceling before %.1fs lifetime and requoting farther back",
+                    distance_ticks,
+                    token_id,
+                    self.config.cancel_after_seconds,
+                )
+                stale_tokens.append(token_id)
+                break
+
         await asyncio.gather(
             *(self._cancel_token_buy_orders(token_id) for token_id in stale_tokens)
         )
+
+    def _best_bid_distance_shrank(
+        self,
+        order: ManagedOrder,
+        book: OrderBook,
+    ) -> bool:
+        if book.best_bid is None or book.tick_size <= 0:
+            return False
+        intended_ticks = (
+            0 if self.config.strategy.join_best_price else self.config.strategy.min_edge_ticks
+        )
+        if intended_ticks <= 0:
+            return False
+        intended_distance = book.tick_size * intended_ticks
+        current_distance = book.best_bid.price - order.quote.price
+        return current_distance < intended_distance
+
+    def _remember_book(self, book: OrderBook) -> None:
+        self.latest_books[book.token_id] = {
+            "best_bid": str(book.best_bid.price) if book.best_bid else "",
+            "best_ask": str(book.best_ask.price) if book.best_ask else "",
+            "spread": str(book.spread) if book.spread is not None else "",
+            "tick_size": str(book.tick_size),
+            "neg_risk": book.neg_risk,
+        }
 
     async def _cancel_order_reliably(self, order: ManagedOrder) -> bool:
         for attempt in range(self.config.cancel_retry_count):
