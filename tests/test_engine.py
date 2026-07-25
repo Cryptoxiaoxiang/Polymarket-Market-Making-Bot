@@ -999,7 +999,7 @@ def test_fine_tick_pending_exit_keeps_one_tenth_cent_price_after_restart(
     assert journal.load_pending_exits() == []
 
 
-def test_expired_quote_task_pauses_and_cancels(tmp_path) -> None:
+def test_expired_quote_task_stops_and_cancels(tmp_path) -> None:
     journal = OrderJournal(tmp_path / "orders.json")
     client = FakeClient(journal.path)
     client.open_orders = [{"id": "order-1"}]
@@ -1012,8 +1012,37 @@ def test_expired_quote_task_pauses_and_cancels(tmp_path) -> None:
     assert expired is True
     assert engine.paused is True
     assert engine.quote_task_expired is True
+    assert engine.stop.is_set()
     assert client.cancelled == ["order-1"]
     assert journal.load() == []
+
+
+def test_engine_run_finishes_automatically_when_quote_task_expires(tmp_path) -> None:
+    journal = OrderJournal(tmp_path / "orders.json")
+    client = FakeClient(journal.path)
+    client.get_orderbook = lambda token_id: OrderBook(
+        token_id=token_id,
+        bids=[],
+        asks=[],
+        tick_size=Decimal("0.01"),
+        min_order_size=Decimal("1"),
+    )
+    engine = MarketMakerEngine(
+        BotConfig(
+            dry_run=True,
+            poll_interval_seconds=0.01,
+            run_duration_seconds=0.03,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+        journal,
+    )
+
+    asyncio.run(asyncio.wait_for(engine.run(), timeout=1))
+
+    assert engine.phase == "stopped"
+    assert engine.quote_task_expired is True
+    assert engine.stop.is_set()
 
 
 

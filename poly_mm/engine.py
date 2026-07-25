@@ -233,7 +233,8 @@ class MarketMakerEngine:
 
     async def _tick(self) -> None:
         self.last_tick_at = time()
-        await self._expire_quote_task_if_due()
+        if await self._expire_quote_task_if_due():
+            return
         await self._reconcile_orders()
         await self._cancel_stale()
         if not await self._refresh_positions_if_due():
@@ -1145,6 +1146,7 @@ class MarketMakerEngine:
         self.paused = True
         self._persist_orders()
         failures = await self._cancel_all_tracked_orders()
+        self.stop.set()
         expiration_error_prefix = "Expired quote task could not cancel orders: "
         if failures:
             self.last_error = expiration_error_prefix + ", ".join(failures)

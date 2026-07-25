@@ -39,6 +39,14 @@ def test_web_actions_only_disable_the_button_that_triggered_them() -> None:
     assert "if (trigger) trigger.disabled = false;" in javascript
 
 
+def test_setup_polling_does_not_replace_a_focused_input() -> None:
+    static_dir = Path(__file__).parents[1] / "poly_mm" / "web_static"
+    javascript = (static_dir / "app.js").read_text(encoding="utf-8")
+
+    assert "const setupFormFocused = setupForm.contains(document.activeElement);" in javascript
+    assert "if (!setupFormDirty && !setupFormFocused)" in javascript
+
+
 def test_start_quote_task_does_not_show_confirmation_dialog() -> None:
     static_dir = Path(__file__).parents[1] / "poly_mm" / "web_static"
     javascript = (static_dir / "app.js").read_text(encoding="utf-8")

@@ -328,7 +328,8 @@ function render(status) {
   byId('save-account').disabled = running;
   byId('run-preflight').disabled = running || !account.private_key_set;
 
-  if (!setupFormDirty) {
+  const setupFormFocused = setupForm.contains(document.activeElement);
+  if (!setupFormDirty && !setupFormFocused) {
     setupForm.elements.namedItem('max_position_per_token').value = configuration.max_position_per_token ?? '';
     setupForm.elements.namedItem('max_total_open_shares').value = configuration.max_total_open_shares ?? '';
     setupForm.elements.namedItem('cancel_after_seconds').value = configuration.cancel_after_seconds ?? '';
