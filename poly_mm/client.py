@@ -147,12 +147,18 @@ class PolymarketClient:
         )
         response.raise_for_status()
         data = response.json()
-        if not isinstance(data, dict) or data.get("oas") is None:
+        if not isinstance(data, dict):
+            raise RuntimeError("Polymarket CLOB market info returned an invalid response")
+        raw_minimum_age = data.get("oas")
+        rewards = data.get("r")
+        if raw_minimum_age is None and isinstance(rewards, dict):
+            raw_minimum_age = rewards.get("oas")
+        if raw_minimum_age is None:
             raise RuntimeError(
                 "Polymarket CLOB market info did not include minimum order age (oas)"
             )
         try:
-            minimum_age = int(data["oas"])
+            minimum_age = int(raw_minimum_age)
         except (TypeError, ValueError) as error:
             raise RuntimeError(
                 "Polymarket CLOB market info returned an invalid minimum order age"
