@@ -295,7 +295,15 @@ function render(status) {
   byId('preflight-status').textContent = preflight ? '预检已通过' : '尚未检查';
 
   const labelsByToken = new Map(markets.map((market) => [market.token_id, market.label]));
-  byId('open-orders-list').innerHTML = orders.map((order) => `<tr><td>${marketCell(labelsByToken.get(order.token_id) || order.token_id)}</td><td><span class="side-badge">${escapeHtml(order.side)}</span></td><td class="order-price">${escapeHtml(order.price)}</td><td>${escapeHtml(order.size)}</td><td>${escapeHtml(order.age_seconds)} 秒</td></tr>`).join('');
+  byId('open-orders-list').innerHTML = orders.map((order) => {
+    const rewardMinimumAge = order.reward_minimum_age_seconds == null
+      ? Number.NaN
+      : Number(order.reward_minimum_age_seconds);
+    const rewardMinimumAgeText = Number.isFinite(rewardMinimumAge)
+      ? `${escapeHtml(rewardMinimumAge)} 秒`
+      : '—';
+    return `<tr><td>${marketCell(labelsByToken.get(order.token_id) || order.token_id)}</td><td><span class="side-badge">${escapeHtml(order.side)}</span></td><td class="order-price">${escapeHtml(order.price)}</td><td>${escapeHtml(order.size)}</td><td>${escapeHtml(order.age_seconds)} 秒</td><td class="reward-minimum-age">${rewardMinimumAgeText}</td></tr>`;
+  }).join('');
   byId('open-orders-table').hidden = orders.length === 0;
   byId('open-orders-empty').hidden = orders.length > 0;
 

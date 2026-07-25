@@ -25,6 +25,24 @@ def test_orderbook_is_sorted_best_price_first(mock_get: Mock) -> None:
     assert str(book.best_ask.price) == "0.38"
 
 
+@patch("poly_mm.client.requests.get")
+def test_minimum_order_age_uses_official_clob_market_info(mock_get: Mock) -> None:
+    response = Mock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {"oas": 30}
+    mock_get.return_value = response
+
+    minimum_age = PolymarketClient(Settings(), dry_run=True).get_minimum_order_age(
+        "condition-1"
+    )
+
+    assert minimum_age == 30
+    mock_get.assert_called_once_with(
+        "https://clob.polymarket.com/clob-markets/condition-1",
+        timeout=10,
+    )
+
+
 def test_sell_limit_is_submitted_non_post_only_at_requested_price() -> None:
     sdk = Mock()
     sdk.create_and_post_order.return_value = {"success": True, "orderID": "sell-1"}

@@ -139,6 +139,30 @@ class PolymarketClient:
             neg_risk=bool(data.get("neg_risk", False)),
         )
 
+    def get_minimum_order_age(self, condition_id: str) -> int:
+        """Return the CLOB market's official minimum reward-eligible order age."""
+        response = requests.get(
+            f"{self.settings.host.rstrip('/')}/clob-markets/{condition_id}",
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict) or data.get("oas") is None:
+            raise RuntimeError(
+                "Polymarket CLOB market info did not include minimum order age (oas)"
+            )
+        try:
+            minimum_age = int(data["oas"])
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                "Polymarket CLOB market info returned an invalid minimum order age"
+            ) from error
+        if minimum_age < 0:
+            raise RuntimeError(
+                "Polymarket CLOB market info returned a negative minimum order age"
+            )
+        return minimum_age
+
     def create_order(
         self,
         quote: Quote,

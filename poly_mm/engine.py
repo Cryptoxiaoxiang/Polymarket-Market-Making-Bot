@@ -67,6 +67,7 @@ class MarketMakerEngine:
         self.last_error = ""
         self.preflight_report = None
         self.latest_books: dict[str, dict[str, str | bool]] = {}
+        self.reward_minimum_ages: dict[str, int] = {}
         self.quote_deadline_at: float | None = None
         self.quote_task_expired = False
         self.websocket_event_count = 0
@@ -80,6 +81,38 @@ class MarketMakerEngine:
 
     def request_stop(self) -> None:
         self.stop.set()
+
+    async def _load_reward_minimum_ages(self) -> None:
+        condition_tokens: dict[str, list[str]] = {}
+        for market in self.config.enabled_markets:
+            if market.condition_id:
+                condition_tokens.setdefault(market.condition_id, []).append(market.token_id)
+        if not condition_tokens:
+            return
+
+        condition_ids = list(condition_tokens)
+        results = await asyncio.gather(
+            *(
+                asyncio.to_thread(self.client.get_minimum_order_age, condition_id)
+                for condition_id in condition_ids
+            ),
+            return_exceptions=True,
+        )
+        for condition_id, result in zip(condition_ids, results, strict=True):
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "Unable to read official minimum order age for %s: %s",
+                    condition_id,
+                    result,
+                )
+                continue
+            for token_id in condition_tokens[condition_id]:
+                self.reward_minimum_ages[token_id] = result
+            logger.info(
+                "Official reward minimum order age for %s: %ss",
+                condition_id,
+                result,
+            )
 
     async def run(self) -> None:
         logger.info("Starting Polymarket maker: dry_run=%s", self.config.dry_run)
@@ -102,6 +135,8 @@ class MarketMakerEngine:
                 )
             elif not self.config.dry_run:
                 logger.warning("Live preflight is disabled by configuration")
+
+            await self._load_reward_minimum_ages()
 
             if self.config.cancel_all_on_start:
                 await self._cancel_configured_orders_on_start()
@@ -1143,6 +1178,9 @@ class MarketMakerEngine:
                 "size": str(order.quote.size),
                 "filled_size": str(order.filled_size),
                 "age_seconds": round(order.age_seconds, 1),
+                "reward_minimum_age_seconds": self.reward_minimum_ages.get(
+                    order.quote.token_id
+                ),
             }
             for order in self.orders.values()
         ]

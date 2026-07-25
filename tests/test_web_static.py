@@ -77,6 +77,18 @@ def test_dashboard_shows_wallet_balance_and_quote_expiry_countdown() -> None:
     assert "updateExpiryMetric(); }, 1000" in javascript
 
 
+def test_dashboard_shows_official_reward_minimum_order_age() -> None:
+    static_dir = Path(__file__).parents[1] / "poly_mm" / "web_static"
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    javascript = (static_dir / "app.js").read_text(encoding="utf-8")
+    styles = (static_dir / "styles.css").read_text(encoding="utf-8")
+
+    assert "奖励所需时长" in html
+    assert "reward_minimum_age_seconds" in javascript
+    assert ".reward-minimum-age" in styles
+    assert "width: min(1720px, 100%)" in styles
+
+
 def test_sidebar_uses_official_polymarket_icon_asset() -> None:
     static_dir = Path(__file__).parents[1] / "poly_mm" / "web_static"
     html = (static_dir / "index.html").read_text(encoding="utf-8")

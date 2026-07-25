@@ -49,6 +49,9 @@ class FakeClient:
     def get_positions(self, condition_ids: list[str] | None = None) -> dict[str, Decimal]:
         return dict(self.positions)
 
+    def get_minimum_order_age(self, condition_id: str) -> int:
+        return 30
+
     def sync_conditional_allowance(self, token_id: str) -> None:
         self.synced_tokens.append(token_id)
 
@@ -335,6 +338,26 @@ def test_active_buy_orders_use_fast_reconciliation_intervals(tmp_path) -> None:
 
     assert engine._current_reconcile_interval() == 0.5
     assert engine._current_position_interval() == 1
+
+
+def test_snapshot_includes_official_reward_minimum_order_age(tmp_path) -> None:
+    engine = MarketMakerEngine(_config(), FakeClient(tmp_path / "orders.json"))
+    order = _order()
+    engine.orders = {order.order_id: order}
+    engine.reward_minimum_ages[order.quote.token_id] = 30
+
+    snapshot = asyncio.run(engine.snapshot())
+
+    assert snapshot["orders"][0]["reward_minimum_age_seconds"] == 30
+
+
+def test_reward_minimum_order_age_is_loaded_for_configured_token(tmp_path) -> None:
+    client = FakeClient(tmp_path / "orders.json")
+    engine = MarketMakerEngine(_config(), client)
+
+    asyncio.run(engine._load_reward_minimum_ages())
+
+    assert engine.reward_minimum_ages == {"token-1": 30}
 
 
 def test_best_bid_moving_toward_live_buy_cancels_before_lifetime(tmp_path) -> None:

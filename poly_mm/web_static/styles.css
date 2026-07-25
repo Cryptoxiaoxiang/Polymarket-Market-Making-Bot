@@ -116,7 +116,7 @@ a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible
 .dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: currentColor; }
 
 .main { min-width: 0; background: var(--bg); }
-.content { width: min(1490px, 100%); margin: 0 auto; padding: 30px 28px 20px; }
+.content { width: min(1720px, 100%); margin: 0 auto; padding: 30px 28px 20px; }
 .view { display: none; }
 .view.active { display: block; }
 .topbar {
@@ -191,7 +191,7 @@ h3 { margin: 0; font-size: 18px; }
 .warning { color: var(--amber) !important; }
 .negative { color: var(--red) !important; }
 
-.dashboard-grid { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(350px, .95fr); gap: 16px; align-items: stretch; }
+.dashboard-grid { display: grid; grid-template-columns: minmax(0, 2.15fr) minmax(350px, .85fr); gap: 16px; align-items: stretch; }
 .stack { display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 16px; min-width: 0; }
 .card { overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
 .card-head, .section-title { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
@@ -206,6 +206,10 @@ h3 { margin: 0; font-size: 18px; }
 .orders-card { display: flex; min-height: 633px; flex-direction: column; }
 .orders-content { display: flex; min-height: 0; flex: 1; flex-direction: column; }
 .orders-content > .table-wrap { padding: 20px; }
+.orders-card table { min-width: 850px; }
+.orders-card th:first-child { width: 58%; }
+.orders-card th:not(:first-child), .orders-card td:not(:first-child) { white-space: nowrap; }
+.reward-minimum-age { color: var(--mint); font-weight: 720; }
 .empty-state { display: flex; min-height: 0; flex: 1; align-items: center; justify-content: center; flex-direction: column; padding: 48px 28px; text-align: center; }
 .empty-state svg { width: 52px; height: 52px; margin-bottom: 18px; padding: 13px; border: 1px solid #3b4a60; border-radius: 50%; fill: none; stroke: #7a889d; stroke-width: 1.3; }
 .empty-state h3 { color: #e5ebf3; }
