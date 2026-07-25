@@ -152,7 +152,7 @@ class PolymarketClient:
         raw_minimum_age = data.get("oas")
         rewards = data.get("r")
         if raw_minimum_age is None and isinstance(rewards, dict):
-            raw_minimum_age = rewards.get("oas")
+            raw_minimum_age = rewards.get("oas", rewards.get("moas"))
         if raw_minimum_age is None:
             raise RuntimeError(
                 "Polymarket CLOB market info did not include minimum order age (oas)"

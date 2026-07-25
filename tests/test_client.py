@@ -48,7 +48,7 @@ def test_minimum_order_age_supports_live_nested_rewards_shape(mock_get: Mock) ->
     response = Mock()
     response.raise_for_status.return_value = None
     response.json.return_value = {
-        "r": {"mi": 100, "ma": 4.5, "e": True, "oas": 30},
+        "r": {"mi": 100, "ma": 4.5, "e": True, "moas": 30},
         "mos": 5,
         "mts": 0.01,
     }
