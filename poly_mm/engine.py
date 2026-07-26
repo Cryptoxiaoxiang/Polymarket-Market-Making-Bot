@@ -183,7 +183,11 @@ class MarketMakerEngine:
                 # accepted SELL is journaled before shutdown cancellation.
                 await asyncio.gather(*self._exit_tasks, return_exceptions=True)
             if self.config.cancel_all_on_shutdown:
-                shutdown_failures = await self._cancel_all_tracked_orders()
+                tracked_failures = await self._cancel_all_tracked_orders()
+                configured_failures = await self._cancel_configured_orders_reliably(
+                    "Shutdown"
+                )
+                shutdown_failures = tracked_failures + configured_failures
             if shutdown_failures:
                 self.phase = "error"
                 self.last_error = "Unable to confirm cancellation for orders: " + ", ".join(
@@ -635,53 +639,133 @@ class MarketMakerEngine:
         This deliberately includes manual orders on those exact tokens. It closes the
         tiny crash window between CLOB acceptance and local journal persistence.
         """
-        markets = self.config.enabled_markets
-        cancellations = await asyncio.gather(
-            *(
-                asyncio.to_thread(
-                    self.client.cancel_market_orders,
-                    market.condition_id,
-                    market.token_id,
-                )
-                for market in markets
-            ),
-            return_exceptions=True,
-        )
-        for market, result in zip(markets, cancellations, strict=True):
-            if isinstance(result, BaseException):
-                raise RuntimeError(
-                    f"Startup cancellation failed for {market.label or market.token_id}: "
-                    f"{result}"
-                ) from result
-        remaining: list[dict] = []
-        for attempt in range(self.config.cancel_retry_count):
-            remaining = []
-            open_order_results = await asyncio.gather(
-                *(
-                    asyncio.to_thread(self.client.get_open_orders, market.token_id)
-                    for market in markets
-                )
+        failures = await self._cancel_configured_orders_reliably("Startup")
+        if failures:
+            raise RuntimeError(
+                "Startup aborted: configured-token cancellation could not be confirmed: "
+                + ", ".join(failures)
             )
-            for rows in open_order_results:
-                remaining.extend(rows)
-            if not remaining:
-                self._persist_orders()
-                logger.info("Startup cancellation confirmed for all configured tokens")
-                return
-            order_ids = [order_id for row in remaining if (order_id := _order_id(row))]
-            await asyncio.gather(
-                *(
-                    asyncio.to_thread(self.client.cancel_order, order_id)
-                    for order_id in order_ids
-                ),
-                return_exceptions=True,
-            )
-            if attempt + 1 < self.config.cancel_retry_count:
-                await asyncio.sleep(self.config.cancel_retry_base_seconds * (2**attempt))
-        raise RuntimeError(
-            "Startup aborted: open configured-token orders remain after cancellation: "
-            + ", ".join(filter(None, (_order_id(row) for row in remaining)))
-        )
+        logger.info("Startup cancellation confirmed for all configured tokens")
+
+    async def _cancel_configured_orders_reliably(self, reason: str) -> list[str]:
+        """Cancel and verify every configured token, including locally unknown orders."""
+        unique_markets = {
+            (market.condition_id, market.token_id): market
+            for market in self.config.enabled_markets
+        }
+        failures: list[str] = []
+        for market in unique_markets.values():
+            label = market.label or market.token_id
+            remaining_ids: list[str] = []
+            last_error = ""
+            for attempt in range(self.config.cancel_retry_count):
+                try:
+                    await asyncio.to_thread(
+                        self.client.cancel_market_orders,
+                        market.condition_id,
+                        market.token_id,
+                    )
+                except Exception as error:
+                    last_error = str(error)
+                    logger.warning(
+                        "%s market-cancel attempt %d/%d failed for %s: %s",
+                        reason,
+                        attempt + 1,
+                        self.config.cancel_retry_count,
+                        label,
+                        error,
+                    )
+
+                try:
+                    remaining = await asyncio.to_thread(
+                        self.client.get_open_orders,
+                        market.token_id,
+                    )
+                except Exception as error:
+                    last_error = str(error)
+                    logger.warning(
+                        "%s open-order verification attempt %d/%d failed for %s: %s",
+                        reason,
+                        attempt + 1,
+                        self.config.cancel_retry_count,
+                        label,
+                        error,
+                    )
+                else:
+                    remaining_ids = [
+                        order_id
+                        for row in remaining
+                        if (order_id := _order_id(row))
+                    ]
+                    if not remaining:
+                        logger.info(
+                            "%s cancellation confirmed for %s",
+                            reason,
+                            label,
+                        )
+                        break
+                    individual_results = await asyncio.gather(
+                        *(
+                            asyncio.to_thread(self.client.cancel_order, order_id)
+                            for order_id in remaining_ids
+                        ),
+                        return_exceptions=True,
+                    )
+                    for order_id, result in zip(
+                        remaining_ids,
+                        individual_results,
+                        strict=True,
+                    ):
+                        if isinstance(result, BaseException):
+                            last_error = str(result)
+                            logger.warning(
+                                "%s individual cancellation failed for %s: %s",
+                                reason,
+                                order_id,
+                                result,
+                            )
+                    try:
+                        remaining = await asyncio.to_thread(
+                            self.client.get_open_orders,
+                            market.token_id,
+                        )
+                    except Exception as error:
+                        last_error = str(error)
+                        logger.warning(
+                            "%s post-cancel verification failed for %s: %s",
+                            reason,
+                            label,
+                            error,
+                        )
+                    else:
+                        remaining_ids = [
+                            order_id
+                            for row in remaining
+                            if (order_id := _order_id(row))
+                        ]
+                        if not remaining:
+                            logger.info(
+                                "%s cancellation confirmed for %s",
+                                reason,
+                                label,
+                            )
+                            break
+                if attempt + 1 < self.config.cancel_retry_count:
+                    await asyncio.sleep(
+                        self.config.cancel_retry_base_seconds * (2**attempt)
+                    )
+            else:
+                detail = "|".join(remaining_ids) or last_error or "unconfirmed"
+                failures.append(f"{label} [{detail}]")
+                logger.critical(
+                    "%s cancellation could not be confirmed for %s: %s",
+                    reason,
+                    label,
+                    detail,
+                )
+        if not failures:
+            self._persist_orders()
+        return failures
 
     async def _cancel_all_tracked_orders(self) -> list[str]:
         failures: list[str] = []
@@ -1093,9 +1177,11 @@ class MarketMakerEngine:
                 )
 
     async def pause_quotes(self) -> dict:
-        """Pause new quotes and cancel every order tracked by this process."""
+        """Pause new quotes and cancel every order on configured tokens."""
         self.paused = True
-        failures = await self._cancel_all_tracked_orders()
+        tracked_failures = await self._cancel_all_tracked_orders()
+        configured_failures = await self._cancel_configured_orders_reliably("Pause")
+        failures = tracked_failures + configured_failures
         if failures:
             raise RuntimeError("Unable to confirm cancellation: " + ", ".join(failures))
         logger.warning("Quoting paused from the local console")
@@ -1145,9 +1231,11 @@ class MarketMakerEngine:
         self.quote_task_expired = True
         self.paused = True
         self._persist_orders()
-        failures = await self._cancel_all_tracked_orders()
+        tracked_failures = await self._cancel_all_tracked_orders()
+        configured_failures = await self._cancel_configured_orders_reliably("Expiry")
+        failures = tracked_failures + configured_failures
         self.stop.set()
-        expiration_error_prefix = "Expired quote task could not cancel orders: "
+        expiration_error_prefix = "Expired quote task could not confirm cancellation: "
         if failures:
             self.last_error = expiration_error_prefix + ", ".join(failures)
             logger.critical(self.last_error)
@@ -1155,7 +1243,9 @@ class MarketMakerEngine:
             if self.last_error.startswith(expiration_error_prefix):
                 self.last_error = ""
             if first_expiration:
-                logger.critical("Quote-task validity expired; all tracked orders canceled")
+                logger.critical(
+                    "Quote-task validity expired; all configured-token orders canceled"
+                )
         return True
 
     async def snapshot(self) -> dict:

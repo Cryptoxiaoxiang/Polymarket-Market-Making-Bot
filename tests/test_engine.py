@@ -20,6 +20,7 @@ class FakeClient:
         }
         self.open_orders: list[dict] = []
         self.cancelled: list[str] = []
+        self.cancelled_markets: list[tuple[str, str]] = []
         self.created: list[tuple[Quote, bool]] = []
         self.synced_tokens: list[str] = []
         self.discarded_submission_keys: list[str] = []
@@ -35,6 +36,7 @@ class FakeClient:
         self.open_orders = [row for row in self.open_orders if row["id"] != order_id]
 
     def cancel_market_orders(self, condition_id: str, token_id: str) -> dict:
+        self.cancelled_markets.append((condition_id, token_id))
         self.open_orders = []
         return {}
 
@@ -911,6 +913,46 @@ def test_startup_cancellation_keeps_restored_orders_for_fill_reconciliation(
     assert "order-1" in engine.orders
 
 
+def test_startup_cancellation_accepts_lost_response_after_empty_verification(
+    tmp_path,
+) -> None:
+    class LostResponseClient(FakeClient):
+        def cancel_market_orders(self, condition_id: str, token_id: str) -> dict:
+            self.open_orders = []
+            raise RuntimeError("Request exception")
+
+    client = LostResponseClient(tmp_path / "orders.json")
+    client.open_orders = [{"id": "unknown-order"}]
+    engine = MarketMakerEngine(_config(), client)
+
+    asyncio.run(engine._cancel_configured_orders_on_start())
+
+    assert client.open_orders == []
+
+
+def test_startup_cancellation_verifies_individual_cancel_with_one_attempt(
+    tmp_path,
+) -> None:
+    class IndividualCancelClient(FakeClient):
+        def cancel_market_orders(self, condition_id: str, token_id: str) -> dict:
+            return {}
+
+    client = IndividualCancelClient(tmp_path / "orders.json")
+    client.open_orders = [{"id": "unknown-order", "asset_id": "token-1"}]
+    engine = MarketMakerEngine(
+        BotConfig(
+            cancel_retry_count=1,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+    )
+
+    asyncio.run(engine._cancel_configured_orders_on_start())
+
+    assert client.cancelled == ["unknown-order"]
+    assert client.open_orders == []
+
+
 def test_post_cancel_reconciliation_exits_late_partial_fill(tmp_path) -> None:
     client = FakeClient(
         tmp_path / "orders.json",
@@ -1015,6 +1057,21 @@ def test_expired_quote_task_stops_and_cancels(tmp_path) -> None:
     assert engine.stop.is_set()
     assert client.cancelled == ["order-1"]
     assert journal.load() == []
+
+
+def test_expired_quote_task_cancels_order_missing_from_local_journal(tmp_path) -> None:
+    journal = OrderJournal(tmp_path / "orders.json")
+    client = FakeClient(journal.path)
+    client.open_orders = [{"id": "unknown-order", "asset_id": "token-1"}]
+    engine = MarketMakerEngine(_config(), client, journal)
+    engine.quote_deadline_at = time() - 1
+
+    expired = asyncio.run(engine._expire_quote_task_if_due())
+
+    assert expired is True
+    assert client.open_orders == []
+    assert client.cancelled_markets == [("condition-1", "token-1")]
+    assert engine.last_error == ""
 
 
 def test_engine_run_finishes_automatically_when_quote_task_expires(tmp_path) -> None:
