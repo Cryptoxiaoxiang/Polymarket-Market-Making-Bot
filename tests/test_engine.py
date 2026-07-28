@@ -883,6 +883,61 @@ def test_position_increase_for_tracked_buy_submits_fill_exit(tmp_path) -> None:
     assert "token-1" in engine.halted_tokens
 
 
+def test_unattributed_position_increase_submits_fill_exit(tmp_path) -> None:
+    client = FakeClient(tmp_path / "orders.json")
+    engine = MarketMakerEngine(
+        BotConfig(
+            sell_on_fill=True,
+            cancel_retry_base_seconds=0,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+    )
+
+    async def scenario() -> None:
+        await engine._refresh_positions_if_due()
+        client.positions = {"token-1": Decimal("2.5")}
+        engine._next_position_poll_at = 0
+        await engine._refresh_positions_if_due()
+        await asyncio.gather(*engine._exit_tasks)
+
+    asyncio.run(scenario())
+
+    quote, post_only = client.created[0]
+    assert quote.side == Side.SELL
+    assert quote.price == Decimal("0.01")
+    assert quote.size == Decimal("2.5")
+    assert post_only is False
+    assert "token-1" in engine.halted_tokens
+    assert engine.last_fill_source == "Unattributed position reconciliation"
+
+
+def test_unattributed_position_is_not_sold_twice_while_exit_is_open(tmp_path) -> None:
+    client = FakeClient(tmp_path / "orders.json")
+    engine = MarketMakerEngine(
+        BotConfig(
+            sell_on_fill=True,
+            cancel_retry_base_seconds=0,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+    )
+
+    async def scenario() -> None:
+        await engine._refresh_positions_if_due()
+        client.positions = {"token-1": Decimal("2.5")}
+        engine._next_position_poll_at = 0
+        await engine._refresh_positions_if_due()
+        await asyncio.gather(*engine._exit_tasks)
+        engine._next_position_poll_at = 0
+        await engine._refresh_positions_if_due()
+
+    asyncio.run(scenario())
+
+    assert len(client.created) == 1
+    assert engine.orders["exit-order"].quote.side == Side.SELL
+
+
 def test_position_existing_before_start_is_halted_but_not_sold(tmp_path) -> None:
     client = FakeClient(tmp_path / "orders.json")
     client.positions = {"token-1": Decimal("5")}

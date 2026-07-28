@@ -380,12 +380,16 @@ class MarketMakerEngine:
             self._position_baseline = dict(refreshed)
             self._positions_initialized = True
         self._next_position_poll_at = now + self._current_position_interval()
-        if self.config.halt_on_fill:
+        if self.config.halt_on_fill or self.config.sell_on_fill:
             for market in self.config.enabled_markets:
                 size = self.positions.get(market.token_id, Decimal())
                 baseline = self._position_baseline.get(market.token_id, Decimal())
                 if first_snapshot:
-                    if size > 0 and market.token_id not in self.halted_tokens:
+                    if (
+                        self.config.halt_on_fill
+                        and size > 0
+                        and market.token_id not in self.halted_tokens
+                    ):
                         self.halted_tokens.add(market.token_id)
                         logger.warning(
                             "Existing position %s detected for %s; token halted",
@@ -397,7 +401,7 @@ class MarketMakerEngine:
                 if size < baseline:
                     baseline = size
                     self._position_baseline[market.token_id] = size
-                if size <= baseline or market.token_id in self.halted_tokens:
+                if size <= baseline:
                     continue
                 tracked_buy = next(
                     (
@@ -420,7 +424,29 @@ class MarketMakerEngine:
                         )
                         await self._handle_fill(tracked_buy, source="Position reconciliation")
                         continue
-                if market.token_id not in self.halted_tokens:
+                if self.config.sell_on_fill:
+                    unprotected = (
+                        size
+                        - baseline
+                        - self._protected_exit_size(market.token_id)
+                    )
+                    if unprotected > 0:
+                        intent = self._queue_position_exit(
+                            market.token_id,
+                            unprotected,
+                            bool(
+                                self.latest_books.get(market.token_id, {}).get(
+                                    "neg_risk", False
+                                )
+                            ),
+                            "Unattributed position reconciliation",
+                        )
+                        if intent is not None:
+                            self._schedule_exit(intent)
+                if (
+                    self.config.halt_on_fill
+                    and market.token_id not in self.halted_tokens
+                ):
                     self.halted_tokens.add(market.token_id)
                     logger.warning(
                         "Unattributed new position %s detected for %s; token halted",
@@ -429,6 +455,69 @@ class MarketMakerEngine:
                     )
                     await self._cancel_token_orders(market.token_id)
         return True
+
+    def _protected_exit_size(self, token_id: str) -> Decimal:
+        """Return shares already covered by a pending or open protective SELL."""
+        pending = sum(
+            (
+                intent.size
+                for intent in self.pending_exits.values()
+                if intent.token_id == token_id
+            ),
+            Decimal(),
+        )
+        open_sell = sum(
+            (
+                max(Decimal(), order.quote.size - order.filled_size)
+                for order in self.orders.values()
+                if order.quote.token_id == token_id
+                and order.quote.side == Side.SELL
+            ),
+            Decimal(),
+        )
+        return pending + open_sell
+
+    def _queue_position_exit(
+        self,
+        token_id: str,
+        size: Decimal,
+        neg_risk: bool,
+        source: str,
+    ) -> ExitIntent | None:
+        """Journal a protective SELL when a new position outlives its BUY record."""
+        if not self.config.sell_on_fill or size <= 0:
+            return None
+        cached_tick = self.latest_books.get(token_id, {}).get("tick_size")
+        created_at = time()
+        source_order_id = (
+            f"position-reconciliation:{token_id}:{int(created_at * 1_000_000)}"
+        )
+        intent = ExitIntent(
+            intent_id=f"{source_order_id}:{size}",
+            source_order_id=source_order_id,
+            token_id=token_id,
+            size=size,
+            neg_risk=neg_risk,
+            created_at=created_at,
+            tick_size=(
+                Decimal(str(cached_tick)) if cached_tick else EXIT_LIMIT_PRICE
+            ),
+        )
+        self.pending_exits[intent.intent_id] = intent
+        self._persist_orders()
+        self.last_fill_source = source
+        self.last_fill_matched_at = None
+        self.last_fill_detected_at = created_at
+        self.last_fill_detection_latency_ms = None
+        logger.critical(
+            "%s detected %s unprotected new shares for %s; "
+            "queued SELL at $%s",
+            source,
+            size,
+            token_id,
+            _exit_limit_price(intent.tick_size),
+        )
+        return intent
 
     async def _reconcile_orders(self) -> None:
         """REST reconciliation is the source-of-truth fallback for WebSocket gaps."""
