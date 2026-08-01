@@ -852,6 +852,115 @@ def test_invalid_exit_token_with_position_pauses_and_preserves_intent(tmp_path) 
     assert engine.pending_exits == {intent.intent_id: intent}
 
 
+def test_zero_balance_exit_is_archived_after_zero_position_confirmation(
+    tmp_path,
+) -> None:
+    class ZeroBalanceClient(FakeClient):
+        def __init__(self, journal_path) -> None:
+            super().__init__(journal_path)
+            self.attempts = 0
+            self.conditional_balance = Decimal()
+
+        def create_order(
+            self,
+            quote: Quote,
+            *,
+            post_only: bool = True,
+            tick_size: Decimal | None = None,
+            submission_key: str | None = None,
+        ) -> ManagedOrder:
+            self.attempts += 1
+            raise RuntimeError("not enough balance / allowance")
+
+    client = ZeroBalanceClient(tmp_path / "orders.json")
+    engine = MarketMakerEngine(_config(), client)
+    engine._exit_retry_base_seconds = 0
+    intent = ExitIntent(
+        intent_id="buy-1:1",
+        source_order_id="buy-1",
+        token_id="token-1",
+        size=Decimal("1"),
+        neg_risk=False,
+        created_at=time() - 31,
+    )
+    engine.pending_exits = {intent.intent_id: intent}
+    engine._persist_orders()
+
+    asyncio.run(engine._submit_fill_exit(intent))
+
+    assert client.attempts == 3
+    assert client.discarded_submission_keys == [intent.intent_id]
+    assert engine.pending_exits == {}
+    assert OrderJournal(tmp_path / "orders.json").load_pending_exits() == []
+
+
+def test_zero_balance_exit_is_retained_when_position_still_exists(tmp_path) -> None:
+    client = FakeClient(tmp_path / "orders.json")
+    client.positions = {"token-1": Decimal("1")}
+    engine = MarketMakerEngine(_config(), client)
+    intent = ExitIntent(
+        intent_id="buy-1:1",
+        source_order_id="buy-1",
+        token_id="token-1",
+        size=Decimal("1"),
+        neg_risk=False,
+        created_at=time() - 31,
+    )
+    engine.pending_exits = {intent.intent_id: intent}
+
+    resolved = asyncio.run(
+        engine._resolve_untradeable_exit(
+            intent,
+            reason="zero conditional-token balance",
+            pause_if_position=False,
+        )
+    )
+
+    assert resolved is False
+    assert engine.paused is False
+    assert engine.pending_exits == {intent.intent_id: intent}
+
+
+def test_invalid_maker_amount_is_archived_after_zero_position_confirmation(
+    tmp_path,
+) -> None:
+    class InvalidMakerClient(FakeClient):
+        def __init__(self, journal_path) -> None:
+            super().__init__(journal_path)
+            self.attempts = 0
+
+        def create_order(
+            self,
+            quote: Quote,
+            *,
+            post_only: bool = True,
+            tick_size: Decimal | None = None,
+            submission_key: str | None = None,
+        ) -> ManagedOrder:
+            self.attempts += 1
+            raise RuntimeError("invalid maker amount")
+
+    client = InvalidMakerClient(tmp_path / "orders.json")
+    engine = MarketMakerEngine(_config(), client)
+    engine._exit_retry_base_seconds = 0
+    intent = ExitIntent(
+        intent_id="buy-1:0.002",
+        source_order_id="buy-1",
+        token_id="token-1",
+        size=Decimal("0.002"),
+        neg_risk=False,
+        created_at=time() - 31,
+    )
+    engine.pending_exits = {intent.intent_id: intent}
+    engine._persist_orders()
+
+    asyncio.run(engine._submit_fill_exit(intent))
+
+    assert client.attempts == 3
+    assert client.discarded_submission_keys == [intent.intent_id]
+    assert engine.pending_exits == {}
+
+
 def test_position_increase_for_tracked_buy_submits_fill_exit(tmp_path) -> None:
     client = FakeClient(tmp_path / "orders.json")
     engine = MarketMakerEngine(

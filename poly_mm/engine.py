@@ -32,8 +32,8 @@ MIN_EXIT_SIZE = Decimal("0.01")
 MISSING_ORDER_CONFIRMATION_ATTEMPTS = 3
 ACTIVE_BUY_RECONCILE_INTERVAL_SECONDS = 0.5
 ACTIVE_BUY_POSITION_INTERVAL_SECONDS = 1.0
-INVALID_TOKEN_CONFIRMATION_ATTEMPTS = 3
-INVALID_TOKEN_MINIMUM_AGE_SECONDS = 30.0
+UNTRADEABLE_EXIT_CONFIRMATION_ATTEMPTS = 3
+EXIT_POSITION_CONFIRMATION_MINIMUM_AGE_SECONDS = 30.0
 
 
 class MarketMakerEngine:
@@ -1010,7 +1010,7 @@ class MarketMakerEngine:
     async def _submit_fill_exit(self, intent: ExitIntent) -> None:
         attempt = 0
         balance_failures = 0
-        invalid_token_failures = 0
+        untradeable_failures = 0
         cached_book = self.latest_books.get(intent.token_id, {})
         cached_tick = cached_book.get("tick_size")
         tick_size = (
@@ -1040,17 +1040,26 @@ class MarketMakerEngine:
                 raise
             except Exception as error:
                 error_text = str(error).casefold()
-                if "invalid token id" in error_text:
-                    invalid_token_failures += 1
+                untradeable_error = (
+                    "invalid token id" in error_text
+                    or "invalid maker amount" in error_text
+                )
+                if untradeable_error:
+                    untradeable_failures += 1
                     if (
-                        invalid_token_failures >= INVALID_TOKEN_CONFIRMATION_ATTEMPTS
+                        untradeable_failures
+                        >= UNTRADEABLE_EXIT_CONFIRMATION_ATTEMPTS
                         and time() - intent.created_at
-                        >= INVALID_TOKEN_MINIMUM_AGE_SECONDS
-                        and await self._resolve_invalid_exit_token(intent)
+                        >= EXIT_POSITION_CONFIRMATION_MINIMUM_AGE_SECONDS
+                        and await self._resolve_untradeable_exit(
+                            intent,
+                            reason=str(error),
+                            pause_if_position=True,
+                        )
                     ):
                         return
                 else:
-                    invalid_token_failures = 0
+                    untradeable_failures = 0
                 if "balance" in error_text or "allowance" in error_text:
                     balance_failures += 1
                     try:
@@ -1078,7 +1087,19 @@ class MarketMakerEngine:
                             sellable = available.quantize(
                                 MIN_EXIT_SIZE, rounding=ROUND_DOWN
                             )
-                            if Decimal() < available < intent.size:
+                            if (
+                                available <= 0
+                                and time() - intent.created_at
+                                >= EXIT_POSITION_CONFIRMATION_MINIMUM_AGE_SECONDS
+                            ):
+                                if await self._resolve_untradeable_exit(
+                                    intent,
+                                    reason="zero conditional-token balance",
+                                    pause_if_position=False,
+                                ):
+                                    return
+                                balance_failures = 0
+                            elif Decimal() < available < intent.size:
                                 self.client.discard_prepared_order(intent.intent_id)
                                 if sellable < MIN_EXIT_SIZE:
                                     self.pending_exits.pop(intent.intent_id, None)
@@ -1145,13 +1166,19 @@ class MarketMakerEngine:
             )
             return
 
-    async def _resolve_invalid_exit_token(self, intent: ExitIntent) -> bool:
-        """Stop deterministic invalid-token retries after a position safety check."""
+    async def _resolve_untradeable_exit(
+        self,
+        intent: ExitIntent,
+        *,
+        reason: str,
+        pause_if_position: bool,
+    ) -> bool:
+        """Archive a stale exit only after the position source-of-truth is empty."""
         try:
             positions = await asyncio.to_thread(self.client.get_positions, None)
         except Exception as error:
             logger.warning(
-                "Unable to verify position for invalid protective SELL token %s: %s",
+                "Unable to verify position for protective SELL token %s: %s",
                 intent.token_id,
                 error,
             )
@@ -1162,13 +1189,23 @@ class MarketMakerEngine:
             self.pending_exits.pop(intent.intent_id, None)
             self._persist_orders()
             logger.critical(
-                "Archived invalid protective SELL for %s after confirming zero position",
+                "Archived stale protective SELL for %s after confirming zero "
+                "position (%s)",
                 intent.token_id,
+                reason,
             )
             return True
+        if not pause_if_position:
+            logger.warning(
+                "Protective SELL for %s still has %s share(s); retaining it after %s",
+                intent.token_id,
+                position,
+                reason,
+            )
+            return False
         self.paused = True
         self.last_error = (
-            "Protective SELL token is invalid while "
+            "Protective SELL cannot be submitted while "
             f"{position} share(s) remain for {intent.token_id}; quoting paused"
         )
         logger.critical(self.last_error)
