@@ -1173,6 +1173,21 @@ def test_pending_fill_exit_survives_restart(tmp_path) -> None:
     assert client.created[0][0].price == Decimal("0.01")
     assert client.created[0][0].size == Decimal("3")
     assert journal.load_pending_exits() == []
+    assert "token-1" not in engine.halted_tokens
+
+
+def test_explicit_task_start_resets_all_per_token_halts(tmp_path) -> None:
+    client = FakeClient(tmp_path / "orders.json")
+    engine = MarketMakerEngine(_config(), client)
+    engine.halted_tokens.update({"token-1", "token-2"})
+    engine.paused = True
+    engine.quote_task_expired = True
+
+    engine._reset_quote_task_for_start()
+
+    assert engine.halted_tokens == set()
+    assert engine.paused is False
+    assert engine.quote_task_expired is False
 
 
 def test_fine_tick_pending_exit_keeps_one_tenth_cent_price_after_restart(

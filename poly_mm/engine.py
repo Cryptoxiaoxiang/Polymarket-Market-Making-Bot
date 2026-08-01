@@ -216,7 +216,7 @@ class MarketMakerEngine:
             )
 
     def _reset_quote_task_for_start(self) -> None:
-        """Every explicit task start begins a fresh validity period."""
+        """Every explicit task start begins with fresh quote-control state."""
         self.quote_deadline_at = (
             time() + self.config.run_duration_seconds
             if self.config.run_duration_seconds > 0
@@ -224,6 +224,11 @@ class MarketMakerEngine:
         )
         self.quote_task_expired = False
         self.paused = False
+        # Per-token halts protect the remainder of the current task after a fill.
+        # They are intentionally session-local: a new explicit task start gets a
+        # fresh position snapshot and can re-halt only tokens that still have a
+        # real position.
+        self.halted_tokens.clear()
         self._persist_orders()
 
     def _persist_orders(self) -> None:
@@ -992,7 +997,9 @@ class MarketMakerEngine:
 
     def _resume_pending_exits(self) -> None:
         for intent in list(self.pending_exits.values()):
-            self.halted_tokens.add(intent.token_id)
+            # Keep crash-safe protective SELLs running, but do not restore the
+            # previous task's quote halt. The first position refresh will halt
+            # the token again if a real position still exists.
             self._schedule_exit(intent)
 
     def _schedule_exit(self, intent: ExitIntent) -> None:
