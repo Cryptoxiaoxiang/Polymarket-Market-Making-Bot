@@ -29,6 +29,7 @@ class PolymarketClient:
         self._prepared_orders: dict[str, object] = {}
         self._sdk = None
         self.websocket_connected = False
+        self.market_websocket_connected = False
 
     def signer_address(self) -> str:
         if not self.settings.private_key:
@@ -494,6 +495,53 @@ class PolymarketClient:
             if self.websocket_connected:
                 logger.info("User WebSocket connection closed")
             self.websocket_connected = False
+
+    async def stream_market_events(self, token_ids: list[str]):
+        """Stream public best-price and order-book events for configured tokens."""
+        if self.dry_run:
+            return
+        from websockets.asyncio.client import connect
+
+        self.market_websocket_connected = False
+        try:
+            async with connect(self.settings.market_ws_url, ping_interval=None) as websocket:
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "assets_ids": token_ids,
+                            "type": "market",
+                            "custom_feature_enabled": True,
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+                self.market_websocket_connected = True
+                logger.info(
+                    "Market WebSocket connected for %d configured token(s)",
+                    len(token_ids),
+                )
+                heartbeat = asyncio.create_task(self._user_ws_heartbeat(websocket))
+                try:
+                    async for raw_message in websocket:
+                        if raw_message == "PONG":
+                            continue
+                        message = json.loads(raw_message)
+                        if isinstance(message, list):
+                            for item in message:
+                                if isinstance(item, dict):
+                                    yield item
+                        elif isinstance(message, dict):
+                            yield message
+                finally:
+                    heartbeat.cancel()
+                    try:
+                        await heartbeat
+                    except asyncio.CancelledError:
+                        pass
+        finally:
+            if self.market_websocket_connected:
+                logger.info("Market WebSocket connection closed")
+            self.market_websocket_connected = False
 
     @staticmethod
     async def _user_ws_heartbeat(websocket) -> None:

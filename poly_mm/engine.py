@@ -10,7 +10,7 @@ from time import monotonic, time
 from poly_mm.client import MAX_ORDER_BATCH_SIZE, PolymarketClient
 from poly_mm.config import BotConfig
 from poly_mm.journal import OrderJournal
-from poly_mm.models import ExitIntent, ManagedOrder, OrderBook, Quote, Side
+from poly_mm.models import ExitIntent, Level, ManagedOrder, OrderBook, Quote, Side
 from poly_mm.risk import RiskManager
 from poly_mm.strategy import PassiveMakerStrategy
 
@@ -32,6 +32,10 @@ MIN_EXIT_SIZE = Decimal("0.01")
 MISSING_ORDER_CONFIRMATION_ATTEMPTS = 3
 ACTIVE_BUY_RECONCILE_INTERVAL_SECONDS = 0.5
 ACTIVE_BUY_POSITION_INTERVAL_SECONDS = 1.0
+FAST_EXIT_BALANCE_POLL_SECONDS = 0.125
+FAST_EXIT_BALANCE_WINDOW_SECONDS = 2.0
+EXIT_ALLOWANCE_SYNC_INTERVAL_SECONDS = 0.5
+SLOW_EXIT_BALANCE_POLL_SECONDS = 0.5
 UNTRADEABLE_EXIT_CONFIRMATION_ATTEMPTS = 3
 EXIT_POSITION_CONFIRMATION_MINIMUM_AGE_SECONDS = 30.0
 
@@ -56,10 +60,22 @@ class MarketMakerEngine:
         self._user_events: asyncio.Queue[dict] = asyncio.Queue()
         self._websocket_task: asyncio.Task[None] | None = None
         self._websocket_consumer_task: asyncio.Task[None] | None = None
+        self._market_websocket_task: asyncio.Task[None] | None = None
+        self._market_websocket_consumer_task: asyncio.Task[None] | None = None
         self._exit_tasks: set[asyncio.Task[None]] = set()
+        self._exit_token_locks: dict[str, asyncio.Lock] = {}
         self._exit_retry_base_seconds = 0.1
+        self._exit_balance_fast_poll_seconds = FAST_EXIT_BALANCE_POLL_SECONDS
+        self._exit_balance_fast_window_seconds = FAST_EXIT_BALANCE_WINDOW_SECONDS
+        self._exit_allowance_sync_interval_seconds = (
+            EXIT_ALLOWANCE_SYNC_INTERVAL_SECONDS
+        )
+        self._exit_balance_slow_poll_seconds = SLOW_EXIT_BALANCE_POLL_SECONDS
         self._next_position_poll_at = 0.0
         self._missing_order_counts: dict[str, int] = {}
+        self._canceling_buy_tokens: set[str] = set()
+        self._quote_wakeup = asyncio.Event()
+        self._market_events: asyncio.Queue[dict] = asyncio.Queue()
         self.paused = False
         self.phase = "created"
         self.started_at = time()
@@ -72,6 +88,8 @@ class MarketMakerEngine:
         self.quote_task_expired = False
         self.websocket_event_count = 0
         self.last_websocket_event_at: float | None = None
+        self.market_websocket_event_count = 0
+        self.last_market_websocket_event_at: float | None = None
         self.last_fill_source = ""
         self.last_fill_matched_at: float | None = None
         self.last_fill_detected_at: float | None = None
@@ -150,6 +168,12 @@ class MarketMakerEngine:
                     self._consume_user_events()
                 )
                 self._websocket_task = asyncio.create_task(self._watch_user_events())
+                self._market_websocket_consumer_task = asyncio.create_task(
+                    self._consume_market_events()
+                )
+                self._market_websocket_task = asyncio.create_task(
+                    self._watch_market_events()
+                )
 
             self.phase = "running"
             while not self.stop.is_set():
@@ -160,8 +184,7 @@ class MarketMakerEngine:
                     self._current_reconcile_interval()
                     - (monotonic() - tick_started),
                 )
-                with suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(self.stop.wait(), timeout=remaining_interval)
+                await self._wait_for_next_cycle(remaining_interval)
         except Exception as error:
             self.phase = "error"
             self.last_error = str(error)
@@ -178,6 +201,14 @@ class MarketMakerEngine:
                 self._websocket_consumer_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await self._websocket_consumer_task
+            if self._market_websocket_task is not None:
+                self._market_websocket_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._market_websocket_task
+            if self._market_websocket_consumer_task is not None:
+                self._market_websocket_consumer_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._market_websocket_consumer_task
             if self._exit_tasks:
                 # Let an in-flight CLOB submission return so a successfully
                 # accepted SELL is journaled before shutdown cancellation.
@@ -197,6 +228,23 @@ class MarketMakerEngine:
             if self.phase != "error":
                 self.phase = "stopped"
             logger.info("Polymarket maker stopped")
+
+    async def _wait_for_next_cycle(self, timeout: float) -> None:
+        """Wake the quote loop early after a WebSocket-driven cancellation."""
+        stop_waiter = asyncio.create_task(self.stop.wait())
+        quote_waiter = asyncio.create_task(self._quote_wakeup.wait())
+        try:
+            await asyncio.wait(
+                {stop_waiter, quote_waiter},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for waiter in (stop_waiter, quote_waiter):
+                if not waiter.done():
+                    waiter.cancel()
+            await asyncio.gather(stop_waiter, quote_waiter, return_exceptions=True)
+            self._quote_wakeup.clear()
 
     def _restore_orders(self) -> None:
         # Dry-run must never consume or overwrite the recovery journal that may
@@ -914,52 +962,58 @@ class MarketMakerEngine:
             await self._cancel_token_buy_orders(order.quote.token_id)
 
     async def _cancel_token_buy_orders(self, token_id: str) -> None:
-        for order in list(self.orders.values()):
-            if order.quote.token_id != token_id or order.quote.side != Side.BUY:
-                continue
-            if await self._cancel_order_reliably(order):
-                final_filled: Decimal | None = None
-                used_trade_fallback = False
-                try:
-                    final_state = await asyncio.to_thread(
-                        self.client.get_order, order.order_id
-                    )
-                    final_filled = _matched_shares(final_state, order)
-                except Exception as error:
-                    used_trade_fallback = True
-                    logger.warning(
-                        "Unable to read final order detail for canceled order %s: %s",
-                        order.order_id,
-                        error,
-                    )
+        if token_id in self._canceling_buy_tokens:
+            return
+        self._canceling_buy_tokens.add(token_id)
+        try:
+            for order in list(self.orders.values()):
+                if order.quote.token_id != token_id or order.quote.side != Side.BUY:
+                    continue
+                if await self._cancel_order_reliably(order):
+                    final_filled: Decimal | None = None
+                    used_trade_fallback = False
                     try:
-                        final_filled = await asyncio.to_thread(
-                            self.client.get_order_matched_shares,
-                            order.order_id,
-                            order.quote.token_id,
-                            order.created_at,
+                        final_state = await asyncio.to_thread(
+                            self.client.get_order, order.order_id
                         )
-                    except Exception as trade_error:
+                        final_filled = _matched_shares(final_state, order)
+                    except Exception as error:
+                        used_trade_fallback = True
                         logger.warning(
-                            "Unable to confirm trades for canceled order %s; retaining it: %s",
+                            "Unable to read final order detail for canceled order %s: %s",
                             order.order_id,
-                            trade_error,
+                            error,
                         )
-                if final_filled is None:
-                    continue
-                if used_trade_fallback and final_filled <= order.filled_size:
-                    await self._reconcile_missing_order(order)
-                    continue
-                if final_filled > order.filled_size:
-                    order.filled_size = min(final_filled, order.quote.size)
-                    self.halted_tokens.add(order.quote.token_id)
-                    late_intent = self._queue_fill_exit(
-                        order, "REST post-cancellation reconciliation"
-                    )
-                    if late_intent is not None:
-                        self._schedule_exit(late_intent)
-                self.orders.pop(order.order_id, None)
-                self._persist_orders()
+                        try:
+                            final_filled = await asyncio.to_thread(
+                                self.client.get_order_matched_shares,
+                                order.order_id,
+                                order.quote.token_id,
+                                order.created_at,
+                            )
+                        except Exception as trade_error:
+                            logger.warning(
+                                "Unable to confirm trades for canceled order %s; retaining it: %s",
+                                order.order_id,
+                                trade_error,
+                            )
+                    if final_filled is None:
+                        continue
+                    if used_trade_fallback and final_filled <= order.filled_size:
+                        await self._reconcile_missing_order(order)
+                        continue
+                    if final_filled > order.filled_size:
+                        order.filled_size = min(final_filled, order.quote.size)
+                        self.halted_tokens.add(order.quote.token_id)
+                        late_intent = self._queue_fill_exit(
+                            order, "REST post-cancellation reconciliation"
+                        )
+                        if late_intent is not None:
+                            self._schedule_exit(late_intent)
+                    self.orders.pop(order.order_id, None)
+                    self._persist_orders()
+        finally:
+            self._canceling_buy_tokens.discard(token_id)
 
     def _queue_fill_exit(self, order: ManagedOrder, source: str) -> ExitIntent | None:
         if not self.config.sell_on_fill or order.filled_size <= 0:
@@ -1015,8 +1069,12 @@ class MarketMakerEngine:
         task.add_done_callback(self._exit_tasks.discard)
 
     async def _submit_fill_exit(self, intent: ExitIntent) -> None:
+        lock = self._exit_token_locks.setdefault(intent.token_id, asyncio.Lock())
+        async with lock:
+            await self._submit_fill_exit_locked(intent)
+
+    async def _submit_fill_exit_locked(self, intent: ExitIntent) -> None:
         attempt = 0
-        balance_failures = 0
         untradeable_failures = 0
         cached_book = self.latest_books.get(intent.token_id, {})
         cached_tick = cached_book.get("tick_size")
@@ -1068,75 +1126,64 @@ class MarketMakerEngine:
                 else:
                     untradeable_failures = 0
                 if "balance" in error_text or "allowance" in error_text:
-                    balance_failures += 1
-                    try:
-                        await asyncio.to_thread(
-                            self.client.sync_conditional_allowance, intent.token_id
+                    logger.critical(
+                        "$%s SELL attempt %d found no immediately sellable balance "
+                        "for %s after %.0fms; polling conditional balance",
+                        exit_limit_price,
+                        attempt,
+                        intent.token_id,
+                        (time() - intent.created_at) * 1000,
+                    )
+                    available = await self._wait_for_exit_balance(intent)
+                    if available is None:
+                        return
+                    if available <= 0:
+                        if await self._resolve_untradeable_exit(
+                            intent,
+                            reason="zero conditional-token balance",
+                            pause_if_position=False,
+                        ):
+                            return
+                        with suppress(asyncio.TimeoutError):
+                            await asyncio.wait_for(
+                                self.stop.wait(),
+                                timeout=self._exit_balance_slow_poll_seconds,
+                            )
+                        continue
+                    sellable = min(available, intent.size).quantize(
+                        MIN_EXIT_SIZE, rounding=ROUND_DOWN
+                    )
+                    if sellable < MIN_EXIT_SIZE:
+                        continue
+                    if sellable < intent.size:
+                        self.client.discard_prepared_order(intent.intent_id)
+                        previous_size = intent.size
+                        remainder = replace(
+                            intent,
+                            intent_id=(
+                                f"{intent.intent_id}:remaining:{int(time() * 1_000_000)}"
+                            ),
+                            size=previous_size - sellable,
+                            tick_size=tick_size,
                         )
-                    except Exception as sync_error:
-                        logger.warning(
-                            "Conditional balance refresh failed for %s: %s",
+                        intent = replace(
+                            intent,
+                            size=sellable,
+                            tick_size=tick_size,
+                        )
+                        self.pending_exits[intent.intent_id] = intent
+                        self.pending_exits[remainder.intent_id] = remainder
+                        self._persist_orders()
+                        self._schedule_exit(remainder)
+                        logger.critical(
+                            "Protective SELL split %s share(s) into immediately "
+                            "sellable %s and pending %s for %s",
+                            previous_size,
+                            sellable,
+                            remainder.size,
                             intent.token_id,
-                            sync_error,
                         )
-                    if balance_failures >= 3:
-                        try:
-                            available = await asyncio.to_thread(
-                                self.client.get_conditional_balance, intent.token_id
-                            )
-                        except Exception as balance_error:
-                            logger.warning(
-                                "Unable to read conditional balance for %s: %s",
-                                intent.token_id,
-                                balance_error,
-                            )
-                        else:
-                            sellable = available.quantize(
-                                MIN_EXIT_SIZE, rounding=ROUND_DOWN
-                            )
-                            if (
-                                available <= 0
-                                and time() - intent.created_at
-                                >= EXIT_POSITION_CONFIRMATION_MINIMUM_AGE_SECONDS
-                            ):
-                                if await self._resolve_untradeable_exit(
-                                    intent,
-                                    reason="zero conditional-token balance",
-                                    pause_if_position=False,
-                                ):
-                                    return
-                                balance_failures = 0
-                            elif Decimal() < available < intent.size:
-                                self.client.discard_prepared_order(intent.intent_id)
-                                if sellable < MIN_EXIT_SIZE:
-                                    self.pending_exits.pop(intent.intent_id, None)
-                                    self._persist_orders()
-                                    logger.critical(
-                                        "$0.01 SELL already reserved or filled for %s; "
-                                        "remaining %s share(s) are below the CLOB's "
-                                        "0.01-share precision",
-                                        intent.token_id,
-                                        available,
-                                    )
-                                    return
-                                previous_size = intent.size
-                                intent = replace(
-                                    intent,
-                                    size=sellable,
-                                    tick_size=tick_size,
-                                )
-                                self.pending_exits[intent.intent_id] = intent
-                                self._persist_orders()
-                                balance_failures = 0
-                                logger.critical(
-                                    "Protective SELL resized from %s to %s share(s) "
-                                    "using CLOB available balance for %s",
-                                    previous_size,
-                                    sellable,
-                                    intent.token_id,
-                                )
-                else:
-                    balance_failures = 0
+                    continue
                 delay = min(
                     self._exit_retry_base_seconds * (2 ** min(attempt - 1, 4)),
                     1.6,
@@ -1172,6 +1219,70 @@ class MarketMakerEngine:
                 attempt,
             )
             return
+
+    async def _wait_for_exit_balance(self, intent: ExitIntent) -> Decimal | None:
+        """Wait for newly matched outcome tokens without spamming SELL requests."""
+        started = monotonic()
+        last_sync_at = float("-inf")
+        while not self.stop.is_set() and intent.intent_id in self.pending_exits:
+            now = monotonic()
+            if now - last_sync_at >= self._exit_allowance_sync_interval_seconds:
+                try:
+                    await asyncio.to_thread(
+                        self.client.sync_conditional_allowance, intent.token_id
+                    )
+                except Exception as sync_error:
+                    logger.warning(
+                        "Conditional balance refresh failed for %s: %s",
+                        intent.token_id,
+                        sync_error,
+                    )
+                last_sync_at = monotonic()
+            try:
+                available = await asyncio.to_thread(
+                    self.client.get_conditional_balance, intent.token_id
+                )
+            except Exception as balance_error:
+                logger.warning(
+                    "Unable to read conditional balance for %s: %s",
+                    intent.token_id,
+                    balance_error,
+                )
+            else:
+                rounded_available = available.quantize(
+                    MIN_EXIT_SIZE, rounding=ROUND_DOWN
+                )
+                if rounded_available >= MIN_EXIT_SIZE:
+                    logger.info(
+                        "Conditional balance %s became sellable for %s after %.0fms",
+                        available,
+                        intent.token_id,
+                        (time() - intent.created_at) * 1000,
+                    )
+                    return available
+                if (
+                    available > 0
+                    and monotonic() - started
+                    >= self._exit_balance_fast_window_seconds
+                ):
+                    # A positive sub-cent residue cannot form a valid CLOB SELL.
+                    # Confirm the position before archiving it as already reserved
+                    # or filled instead of retrying an impossible order forever.
+                    return Decimal()
+                if (
+                    time() - intent.created_at
+                    >= EXIT_POSITION_CONFIRMATION_MINIMUM_AGE_SECONDS
+                ):
+                    return Decimal()
+            elapsed = monotonic() - started
+            delay = (
+                self._exit_balance_fast_poll_seconds
+                if elapsed < self._exit_balance_fast_window_seconds
+                else self._exit_balance_slow_poll_seconds
+            )
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.stop.wait(), timeout=delay)
+        return None
 
     async def _resolve_untradeable_exit(
         self,
@@ -1242,6 +1353,30 @@ class MarketMakerEngine:
                 await asyncio.wait_for(self.stop.wait(), timeout=backoff)
             backoff = min(backoff * 2, 30)
 
+    async def _watch_market_events(self) -> None:
+        token_ids = list(
+            dict.fromkeys(
+                market.token_id
+                for market in self.config.enabled_markets
+                if market.token_id
+            )
+        )
+        backoff = 1.0
+        while not self.stop.is_set():
+            try:
+                async for event in self.client.stream_market_events(token_ids):
+                    await self._market_events.put(event)
+                    backoff = 1.0
+                    if self.stop.is_set():
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning("Market WebSocket disconnected: %s; reconnecting", error)
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self.stop.wait(), timeout=backoff)
+            backoff = min(backoff * 2, 30)
+
     async def _consume_user_events(self) -> None:
         """Handle authenticated user events independently of the quote cycle."""
         while True:
@@ -1253,6 +1388,107 @@ class MarketMakerEngine:
                 await self._handle_user_event(event, received_at=received_at)
             finally:
                 self._user_events.task_done()
+
+    async def _consume_market_events(self) -> None:
+        """React to best-price changes without waiting for the REST quote cycle."""
+        while True:
+            event = await self._market_events.get()
+            received_at = time()
+            self.market_websocket_event_count += 1
+            self.last_market_websocket_event_at = received_at
+            try:
+                await self._handle_market_event(event)
+            finally:
+                self._market_events.task_done()
+
+    async def _handle_market_event(self, event: dict) -> None:
+        event_kind = str(event.get("event_type") or "").casefold()
+        if event_kind == "tick_size_change":
+            token_id = str(event.get("asset_id") or "")
+            new_tick = _positive_decimal(event.get("new_tick_size"))
+            if token_id and new_tick is not None:
+                cached = self.latest_books.setdefault(token_id, {})
+                cached["tick_size"] = str(new_tick)
+            return
+
+        updates: list[tuple[str, Decimal, Decimal | None]] = []
+        if event_kind == "best_bid_ask":
+            token_id = str(event.get("asset_id") or "")
+            best_bid = _positive_decimal(event.get("best_bid"))
+            best_ask = _positive_decimal(event.get("best_ask"))
+            if token_id and best_bid is not None:
+                updates.append((token_id, best_bid, best_ask))
+        elif event_kind == "price_change":
+            for change in event.get("price_changes") or []:
+                if not isinstance(change, dict):
+                    continue
+                token_id = str(change.get("asset_id") or "")
+                best_bid = _positive_decimal(change.get("best_bid"))
+                best_ask = _positive_decimal(change.get("best_ask"))
+                if token_id and best_bid is not None:
+                    updates.append((token_id, best_bid, best_ask))
+        elif event_kind == "book":
+            token_id = str(event.get("asset_id") or "")
+            bid_prices = [
+                price
+                for row in event.get("bids") or []
+                if isinstance(row, dict)
+                and (price := _positive_decimal(row.get("price"))) is not None
+            ]
+            ask_prices = [
+                price
+                for row in event.get("asks") or []
+                if isinstance(row, dict)
+                and (price := _positive_decimal(row.get("price"))) is not None
+            ]
+            if token_id and bid_prices:
+                updates.append(
+                    (token_id, max(bid_prices), min(ask_prices) if ask_prices else None)
+                )
+
+        for token_id, best_bid, best_ask in updates:
+            await self._handle_best_price_update(token_id, best_bid, best_ask)
+
+    async def _handle_best_price_update(
+        self,
+        token_id: str,
+        best_bid: Decimal,
+        best_ask: Decimal | None,
+    ) -> None:
+        cached = self.latest_books.setdefault(token_id, {})
+        cached["best_bid"] = str(best_bid)
+        if best_ask is not None:
+            cached["best_ask"] = str(best_ask)
+            cached["spread"] = str(best_ask - best_bid)
+        tick_size = _positive_decimal(cached.get("tick_size"))
+        if tick_size is None:
+            return
+        book = OrderBook(
+            token_id=token_id,
+            bids=[Level(best_bid, Decimal())],
+            asks=([Level(best_ask, Decimal())] if best_ask is not None else []),
+            tick_size=tick_size,
+            min_order_size=Decimal(),
+            neg_risk=bool(cached.get("neg_risk", False)),
+        )
+        active_orders = [
+            order
+            for order in self.orders.values()
+            if order.quote.token_id == token_id and order.quote.side == Side.BUY
+        ]
+        if not any(self._best_bid_distance_shrank(order, book) for order in active_orders):
+            return
+        distance_ticks = min(
+            (best_bid - order.quote.price) / tick_size for order in active_orders
+        )
+        logger.warning(
+            "Market WebSocket best-bid distance shrank to %s tick(s) for %s; "
+            "canceling immediately and waking the quote loop",
+            distance_ticks,
+            token_id,
+        )
+        await self._cancel_token_buy_orders(token_id)
+        self._quote_wakeup.set()
 
     async def _handle_user_event(
         self,
@@ -1424,6 +1660,9 @@ class MarketMakerEngine:
             "dry_run": self.config.dry_run,
             "paused": self.paused,
             "websocket_connected": bool(getattr(self.client, "websocket_connected", False)),
+            "market_websocket_connected": bool(
+                getattr(self.client, "market_websocket_connected", False)
+            ),
             "started_at": self.started_at,
             "last_tick_at": self.last_tick_at,
             "last_error": self.last_error,
@@ -1442,6 +1681,8 @@ class MarketMakerEngine:
             "monitoring": {
                 "websocket_event_count": self.websocket_event_count,
                 "last_websocket_event_at": self.last_websocket_event_at,
+                "market_websocket_event_count": self.market_websocket_event_count,
+                "last_market_websocket_event_at": self.last_market_websocket_event_at,
                 "last_fill_source": self.last_fill_source,
                 "last_fill_matched_at": self.last_fill_matched_at,
                 "last_fill_detected_at": self.last_fill_detected_at,
@@ -1494,6 +1735,14 @@ def _event_timestamp(event: dict) -> float | None:
     if value >= 1_000_000_000_000:
         value /= 1000
     return value
+
+
+def _positive_decimal(value: object) -> Decimal | None:
+    try:
+        result = Decimal(str(value))
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    return result if result > 0 else None
 
 
 def _exit_limit_price(tick_size: Decimal | None) -> Decimal:

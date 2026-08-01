@@ -437,6 +437,48 @@ def test_live_buy_stays_when_best_bid_distance_is_unchanged_or_wider(tmp_path) -
     assert set(engine.orders) == {"order-1"}
 
 
+def test_market_websocket_cancels_when_best_bid_moves_toward_order(tmp_path) -> None:
+    client = FakeClient(tmp_path / "orders.json")
+    client.open_orders = [{"id": "order-1"}]
+    engine = MarketMakerEngine(
+        BotConfig(
+            cancel_after_seconds=60,
+            cancel_retry_base_seconds=0,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+    )
+    order = ManagedOrder(
+        "order-1",
+        Quote("token-1", Side.BUY, Decimal("0.42"), Decimal("5")),
+        time(),
+    )
+    engine.orders = {order.order_id: order}
+    engine.latest_books["token-1"] = {
+        "best_bid": "0.44",
+        "best_ask": "0.50",
+        "spread": "0.06",
+        "tick_size": "0.01",
+        "neg_risk": False,
+    }
+
+    asyncio.run(
+        engine._handle_market_event(
+            {
+                "event_type": "best_bid_ask",
+                "asset_id": "token-1",
+                "best_bid": "0.43",
+                "best_ask": "0.50",
+            }
+        )
+    )
+
+    assert client.cancelled == ["order-1"]
+    assert engine.orders == {}
+    assert engine.latest_books["token-1"]["best_bid"] == "0.43"
+    assert engine._quote_wakeup.is_set()
+
+
 def test_buy_still_cancels_at_lifetime_without_book_monitoring(tmp_path) -> None:
     client = FakeClient(tmp_path / "orders.json")
     client.open_orders = [{"id": "order-1"}]
@@ -710,6 +752,7 @@ def test_fill_exit_retries_until_shares_are_available(tmp_path) -> None:
         client,
     )
     engine._exit_retry_base_seconds = 0
+    engine._exit_balance_fast_window_seconds = 0
     order = _order()
     order.filled_size = Decimal("2")
     engine.orders = {order.order_id: order}
@@ -756,6 +799,7 @@ def test_fill_exit_clears_untradeable_residue_after_repeated_balance_errors(
         client,
     )
     engine._exit_retry_base_seconds = 0
+    engine._exit_balance_fast_window_seconds = 0
     order = _order()
     order.filled_size = Decimal("1.18888")
     engine.orders = {order.order_id: order}
@@ -766,10 +810,111 @@ def test_fill_exit_clears_untradeable_residue_after_repeated_balance_errors(
 
     asyncio.run(scenario())
 
-    assert client.attempts == 3
+    assert client.attempts == 1
     assert client.discarded_submission_keys == ["order-1:1.18888"]
     assert engine.pending_exits == {}
     assert OrderJournal(tmp_path / "orders.json").load_pending_exits() == []
+
+
+def test_fill_exit_polls_balance_before_second_submission(tmp_path) -> None:
+    class DelayedBalanceClient(FakeClient):
+        def __init__(self, journal_path) -> None:
+            super().__init__(journal_path)
+            self.attempts = 0
+            self.balance_reads = iter(
+                [Decimal(), Decimal(), Decimal("2")]
+            )
+
+        def get_conditional_balance(self, token_id: str) -> Decimal:
+            return next(self.balance_reads)
+
+        def create_order(
+            self,
+            quote: Quote,
+            *,
+            post_only: bool = True,
+            tick_size: Decimal | None = None,
+            submission_key: str | None = None,
+        ) -> ManagedOrder:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("not enough balance / allowance")
+            return super().create_order(
+                quote,
+                post_only=post_only,
+                tick_size=tick_size,
+                submission_key=submission_key,
+            )
+
+    client = DelayedBalanceClient(tmp_path / "orders.json")
+    engine = MarketMakerEngine(_config(), client)
+    engine._exit_balance_fast_poll_seconds = 0
+    engine._exit_allowance_sync_interval_seconds = 60
+    intent = ExitIntent(
+        intent_id="buy-1:2",
+        source_order_id="buy-1",
+        token_id="token-1",
+        size=Decimal("2"),
+        neg_risk=False,
+        created_at=time(),
+    )
+    engine.pending_exits = {intent.intent_id: intent}
+
+    asyncio.run(engine._submit_fill_exit(intent))
+
+    assert client.attempts == 2
+    assert client.synced_tokens == ["token-1"]
+    assert client.created[0][0].size == Decimal("2")
+    assert engine.pending_exits == {}
+
+
+def test_fill_exit_sells_available_partial_balance_then_remainder(tmp_path) -> None:
+    class PartialBalanceClient(FakeClient):
+        def __init__(self, journal_path) -> None:
+            super().__init__(journal_path)
+            self.attempts = 0
+            self.conditional_balance = Decimal("3")
+
+        def create_order(
+            self,
+            quote: Quote,
+            *,
+            post_only: bool = True,
+            tick_size: Decimal | None = None,
+            submission_key: str | None = None,
+        ) -> ManagedOrder:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("not enough balance / allowance")
+            self.created.append((quote, post_only))
+            return ManagedOrder(f"exit-{self.attempts}", quote, time())
+
+    client = PartialBalanceClient(tmp_path / "orders.json")
+    engine = MarketMakerEngine(_config(), client)
+    intent = ExitIntent(
+        intent_id="buy-1:5",
+        source_order_id="buy-1",
+        token_id="token-1",
+        size=Decimal("5"),
+        neg_risk=False,
+        created_at=time(),
+    )
+    engine.pending_exits = {intent.intent_id: intent}
+
+    async def scenario() -> None:
+        engine._schedule_exit(intent)
+        while engine._exit_tasks:
+            await asyncio.gather(*list(engine._exit_tasks))
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    assert [quote.size for quote, _ in client.created] == [
+        Decimal("3.00"),
+        Decimal("2.00"),
+    ]
+    assert engine.pending_exits == {}
+    assert client.discarded_submission_keys == [intent.intent_id]
 
 
 def test_invalid_exit_token_is_archived_after_zero_position_confirmation(
@@ -888,7 +1033,7 @@ def test_zero_balance_exit_is_archived_after_zero_position_confirmation(
 
     asyncio.run(engine._submit_fill_exit(intent))
 
-    assert client.attempts == 3
+    assert client.attempts == 1
     assert client.discarded_submission_keys == [intent.intent_id]
     assert engine.pending_exits == {}
     assert OrderJournal(tmp_path / "orders.json").load_pending_exits() == []
