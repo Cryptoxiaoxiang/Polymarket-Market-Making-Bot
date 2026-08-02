@@ -605,6 +605,51 @@ def test_quote_batch_keeps_successes_when_an_individual_order_is_rejected(
     assert [order.order_id for order in restored] == ["order-token-1"]
 
 
+def test_quote_response_cancels_buy_when_fill_event_halted_token_first(
+    tmp_path,
+) -> None:
+    class FillBeforeResponseClient(FakeClient):
+        engine: MarketMakerEngine
+
+        def get_orderbook(self, token_id: str) -> OrderBook:
+            return OrderBook(
+                token_id,
+                [Level(Decimal("0.40"), Decimal("100"))],
+                [Level(Decimal("0.45"), Decimal("100"))],
+                Decimal("0.01"),
+                Decimal("5"),
+            )
+
+        def create_orders_batch(
+            self,
+            quotes: list[tuple[Quote, Decimal]],
+            *,
+            post_only: bool = True,
+        ) -> list[ManagedOrder | Exception]:
+            quote = quotes[0][0]
+            order = ManagedOrder("late-order", quote, time())
+            self.open_orders = [{"id": order.order_id}]
+            # Model a user-channel fill arriving while the HTTP request is still
+            # waiting for its create-order response.
+            self.engine.halted_tokens.add(quote.token_id)
+            return [order]
+
+    client = FillBeforeResponseClient(tmp_path / "orders.json")
+    engine = MarketMakerEngine(
+        BotConfig(
+            cancel_retry_base_seconds=0,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+    )
+    client.engine = engine
+
+    asyncio.run(engine._tick())
+
+    assert client.cancelled == ["late-order"]
+    assert engine.orders == {}
+
+
 def test_buy_fill_submits_same_size_sell_at_one_cent(tmp_path) -> None:
     client = FakeClient(tmp_path / "orders.json")
     client.open_orders = [{"id": "order-1"}]
@@ -1036,6 +1081,7 @@ def test_zero_balance_exit_is_archived_after_zero_position_confirmation(
     assert client.attempts == 1
     assert client.discarded_submission_keys == [intent.intent_id]
     assert engine.pending_exits == {}
+    assert engine._recent_exit_suppression_size("token-1") == Decimal("1")
     assert OrderJournal(tmp_path / "orders.json").load_pending_exits() == []
 
 
@@ -1190,6 +1236,255 @@ def test_unattributed_position_is_not_sold_twice_while_exit_is_open(tmp_path) ->
 
     assert len(client.created) == 1
     assert engine.orders["exit-order"].quote.side == Side.SELL
+
+
+def test_late_websocket_buy_trade_uses_recently_removed_order(tmp_path) -> None:
+    client = FakeClient(tmp_path / "orders.json")
+    engine = MarketMakerEngine(
+        BotConfig(
+            sell_on_fill=True,
+            cancel_retry_base_seconds=0,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+    )
+    order = _order()
+    engine.orders = {order.order_id: order}
+    engine._pop_order(order.order_id)
+
+    async def scenario() -> None:
+        await engine._handle_user_event(
+            {
+                "event_type": "trade",
+                "id": "trade-late-buy",
+                "status": "MATCHED",
+                "matchtime": str(time() - 0.05),
+                "maker_orders": [
+                    {
+                        "order_id": order.order_id,
+                        "matched_amount": "2",
+                        "asset_id": "token-1",
+                        "side": "BUY",
+                    }
+                ],
+            },
+            received_at=time(),
+        )
+        await asyncio.gather(*engine._exit_tasks)
+
+    asyncio.run(scenario())
+
+    assert client.created[0][0].side == Side.SELL
+    assert client.created[0][0].size == Decimal("2")
+    assert order.exit_requested_size == Decimal("2")
+    assert engine.last_fill_source == "WebSocket"
+
+
+def test_trade_lifecycle_repeat_does_not_queue_duplicate_sell(tmp_path) -> None:
+    client = FakeClient(tmp_path / "orders.json")
+    client.open_orders = [{"id": "order-1"}]
+    engine = MarketMakerEngine(
+        BotConfig(
+            sell_on_fill=True,
+            cancel_retry_base_seconds=0,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+    )
+    engine.orders = {"order-1": _order()}
+    event = {
+        "event_type": "trade",
+        "id": "trade-with-lifecycle-updates",
+        "status": "MATCHED",
+        "maker_orders": [
+            {
+                "order_id": "order-1",
+                "matched_amount": "2",
+                "asset_id": "token-1",
+                "side": "BUY",
+            }
+        ],
+    }
+
+    async def scenario() -> None:
+        await engine._handle_user_event(event)
+        await engine._handle_user_event({**event, "status": "CONFIRMED"})
+        await asyncio.gather(*engine._exit_tasks)
+
+    asyncio.run(scenario())
+
+    assert len(client.created) == 1
+    assert client.created[0][0].size == Decimal("2")
+
+
+def test_confirmed_protective_sell_suppresses_stale_position_snapshot(tmp_path) -> None:
+    client = FakeClient(tmp_path / "orders.json")
+    engine = MarketMakerEngine(
+        BotConfig(
+            sell_on_fill=True,
+            cancel_retry_base_seconds=0,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+    )
+    sell = ManagedOrder(
+        "sell-1",
+        Quote("token-1", Side.SELL, Decimal("0.01"), Decimal("2")),
+        time(),
+    )
+    engine.orders = {sell.order_id: sell}
+
+    async def scenario() -> None:
+        await engine._refresh_positions_if_due()
+        await engine._handle_user_event(
+            {
+                "event_type": "trade",
+                "id": "trade-sell-1",
+                "status": "MATCHED",
+                "maker_orders": [
+                    {
+                        "order_id": sell.order_id,
+                        "matched_amount": "2",
+                        "asset_id": "token-1",
+                        "side": "SELL",
+                    }
+                ],
+            }
+        )
+        engine._pop_order(sell.order_id)
+        client.positions = {"token-1": Decimal("2")}
+        engine._next_position_poll_at = 0
+        await engine._refresh_positions_if_due()
+
+    asyncio.run(scenario())
+
+    assert client.created == []
+    assert engine.pending_exits == {}
+    assert engine._recent_exit_suppression_size("token-1") == Decimal("2")
+
+
+def test_partial_protective_sell_fill_suppresses_only_filled_shares(tmp_path) -> None:
+    client = FakeClient(tmp_path / "orders.json")
+    engine = MarketMakerEngine(
+        BotConfig(
+            sell_on_fill=True,
+            cancel_retry_base_seconds=0,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+    )
+    sell = ManagedOrder(
+        "sell-1",
+        Quote("token-1", Side.SELL, Decimal("0.01"), Decimal("2")),
+        time(),
+    )
+    engine.orders = {sell.order_id: sell}
+
+    async def scenario() -> None:
+        await engine._refresh_positions_if_due()
+        await engine._handle_user_event(
+            {
+                "event_type": "trade",
+                "id": "trade-partial-sell",
+                "status": "MATCHED",
+                "maker_orders": [
+                    {
+                        "order_id": sell.order_id,
+                        "matched_amount": "1",
+                        "asset_id": "token-1",
+                        "side": "SELL",
+                    }
+                ],
+            }
+        )
+        client.positions = {"token-1": Decimal("2")}
+        engine._next_position_poll_at = 0
+        await engine._refresh_positions_if_due()
+
+    asyncio.run(scenario())
+
+    assert client.created == []
+    assert sell.filled_size == Decimal("1")
+    assert engine._protected_exit_size("token-1") == Decimal("1")
+    assert engine._recent_exit_suppression_size("token-1") == Decimal("1")
+
+
+def test_new_unattributed_websocket_buy_bypasses_recent_sell_window(tmp_path) -> None:
+    client = FakeClient(tmp_path / "orders.json")
+    engine = MarketMakerEngine(
+        BotConfig(
+            sell_on_fill=True,
+            cancel_retry_base_seconds=0,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+    )
+    engine._recent_exit_fills["token-1"] = (Decimal("2"), float("inf"))
+    client.positions = {"token-1": Decimal("2")}
+    engine._positions_initialized = True
+    engine._position_baseline = {"token-1": Decimal()}
+
+    async def scenario() -> None:
+        await engine._handle_user_event(
+            {
+                "event_type": "trade",
+                "id": "trade-new-buy",
+                "status": "MATCHED",
+                "trader_side": "MAKER",
+                "owner": "account-1",
+                "maker_orders": [
+                    {
+                        "order_id": "late-buy-order",
+                        "owner": "account-1",
+                        "matched_amount": "1.5",
+                        "asset_id": "token-1",
+                        "side": "BUY",
+                    }
+                ],
+            }
+        )
+        await asyncio.gather(*engine._exit_tasks)
+
+    asyncio.run(scenario())
+
+    assert len(client.created) == 1
+    assert client.created[0][0].size == Decimal("1.5")
+    assert engine._orphan_buy_exit_sizes == {"late-buy-order": Decimal("1.5")}
+
+    late_order = ManagedOrder(
+        "late-buy-order",
+        Quote("token-1", Side.BUY, Decimal("0.42"), Decimal("5")),
+        time(),
+    )
+    engine._register_order(late_order)
+
+    assert late_order.filled_size == Decimal("1.5")
+    assert late_order.exit_requested_size == Decimal("1.5")
+
+
+def test_expired_recent_sell_window_does_not_hide_real_position(tmp_path) -> None:
+    client = FakeClient(tmp_path / "orders.json")
+    engine = MarketMakerEngine(
+        BotConfig(
+            sell_on_fill=True,
+            cancel_retry_base_seconds=0,
+            markets=[MarketConfig(token_id="token-1", condition_id="condition-1")],
+        ),
+        client,
+    )
+    engine._positions_initialized = True
+    engine._position_baseline = {"token-1": Decimal()}
+    engine._recent_exit_fills["token-1"] = (Decimal("2"), 0.0)
+    client.positions = {"token-1": Decimal("2")}
+
+    async def scenario() -> None:
+        await engine._refresh_positions_if_due(force=True)
+        await asyncio.gather(*engine._exit_tasks)
+
+    asyncio.run(scenario())
+
+    assert len(client.created) == 1
+    assert client.created[0][0].size == Decimal("2")
 
 
 def test_position_existing_before_start_is_halted_but_not_sold(tmp_path) -> None:

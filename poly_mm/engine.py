@@ -38,6 +38,8 @@ EXIT_ALLOWANCE_SYNC_INTERVAL_SECONDS = 0.5
 SLOW_EXIT_BALANCE_POLL_SECONDS = 0.5
 UNTRADEABLE_EXIT_CONFIRMATION_ATTEMPTS = 3
 EXIT_POSITION_CONFIRMATION_MINIMUM_AGE_SECONDS = 30.0
+RECENT_ORDER_RETENTION_SECONDS = 60.0
+RECENT_EXIT_SUPPRESSION_SECONDS = 5.0
 
 
 class MarketMakerEngine:
@@ -73,7 +75,13 @@ class MarketMakerEngine:
         self._exit_balance_slow_poll_seconds = SLOW_EXIT_BALANCE_POLL_SECONDS
         self._next_position_poll_at = 0.0
         self._missing_order_counts: dict[str, int] = {}
-        self._canceling_buy_tokens: set[str] = set()
+        self._recent_orders: dict[str, tuple[ManagedOrder, float]] = {}
+        self._trade_matched_fills: dict[str, Decimal] = {}
+        self._confirmed_exit_fills: dict[str, Decimal] = {}
+        self._recent_exit_fills: dict[str, tuple[Decimal, float]] = {}
+        self._orphan_buy_exit_sizes: dict[str, Decimal] = {}
+        self._seen_user_trade_matches: set[tuple[str, str]] = set()
+        self._cancel_buy_token_locks: dict[str, asyncio.Lock] = {}
         self._quote_wakeup = asyncio.Event()
         self._market_events: asyncio.Queue[dict] = asyncio.Queue()
         self.paused = False
@@ -358,7 +366,7 @@ class MarketMakerEngine:
                             result,
                         )
                         continue
-                    self.orders[result.order_id] = result
+                    self._register_order(result)
                     submitted += 1
                     chunk_submitted += 1
                 if chunk_submitted:
@@ -386,9 +394,27 @@ class MarketMakerEngine:
                         error,
                     )
                     continue
-                self.orders[order.order_id] = order
+                self._register_order(order)
                 self._persist_orders()
                 submitted += 1
+        late_halted_tokens = {
+            order.quote.token_id
+            for order in self.orders.values()
+            if order.quote.side == Side.BUY
+            and order.quote.token_id in self.halted_tokens
+        }
+        if late_halted_tokens:
+            logger.warning(
+                "Canceling %d late-registered BUY token(s) whose fill event "
+                "arrived before the create-order response",
+                len(late_halted_tokens),
+            )
+            await asyncio.gather(
+                *(
+                    self._cancel_token_buy_orders(token_id)
+                    for token_id in late_halted_tokens
+                )
+            )
         if proposals:
             logger.info(
                 "Quote batch submitted %d/%d order(s) in %.0fms",
@@ -416,9 +442,120 @@ class MarketMakerEngine:
             )
         return self.config.position_poll_interval_seconds
 
-    async def _refresh_positions_if_due(self) -> bool:
+    def _remember_recent_order(self, order: ManagedOrder) -> None:
+        self._prune_recent_orders()
+        self._recent_orders[order.order_id] = (
+            order,
+            monotonic() + RECENT_ORDER_RETENTION_SECONDS,
+        )
+
+    def _prune_recent_orders(self) -> None:
         now = monotonic()
-        if now < self._next_position_poll_at:
+        expired_ids = [
+            order_id
+            for order_id, (_order, expires_at) in self._recent_orders.items()
+            if now >= expires_at
+        ]
+        for order_id in expired_ids:
+            self._recent_orders.pop(order_id, None)
+            self._trade_matched_fills.pop(order_id, None)
+            self._confirmed_exit_fills.pop(order_id, None)
+            self._orphan_buy_exit_sizes.pop(order_id, None)
+
+    def _register_order(self, order: ManagedOrder) -> None:
+        orphan_buy_exit = self._orphan_buy_exit_sizes.pop(
+            order.order_id, Decimal()
+        )
+        if order.quote.side == Side.BUY and orphan_buy_exit > 0:
+            covered = min(order.quote.size, orphan_buy_exit)
+            order.filled_size = max(order.filled_size, covered)
+            order.exit_requested_size = max(order.exit_requested_size, covered)
+        confirmed_sell = self._confirmed_exit_fills.get(order.order_id, Decimal())
+        if order.quote.side == Side.SELL and confirmed_sell > 0:
+            order.filled_size = max(
+                order.filled_size,
+                min(order.quote.size, confirmed_sell),
+            )
+        self.orders[order.order_id] = order
+
+    def _pop_order(self, order_id: str) -> ManagedOrder | None:
+        order = self.orders.pop(order_id, None)
+        if order is not None:
+            self._remember_recent_order(order)
+        return order
+
+    def _lookup_order(self, order_id: str) -> ManagedOrder | None:
+        order = self.orders.get(order_id)
+        if order is not None:
+            return order
+        self._prune_recent_orders()
+        recent = self._recent_orders.get(order_id)
+        if recent is None:
+            return None
+        order, _expires_at = recent
+        return order
+
+    def _record_recent_exit_coverage(
+        self,
+        token_id: str,
+        size: Decimal,
+        *,
+        source: str,
+    ) -> None:
+        """Temporarily cover stale position snapshots with confirmed evidence."""
+        if size <= 0:
+            return
+        now = monotonic()
+        recent_size, expires_at = self._recent_exit_fills.get(
+            token_id, (Decimal(), 0.0)
+        )
+        if now >= expires_at:
+            recent_size = Decimal()
+        self._recent_exit_fills[token_id] = (
+            recent_size + size,
+            now + RECENT_EXIT_SUPPRESSION_SECONDS,
+        )
+        logger.info(
+            "%s confirmed %s covered share(s) for %s; suppressing an equal "
+            "stale position for %.1fs",
+            source,
+            size,
+            token_id,
+            RECENT_EXIT_SUPPRESSION_SECONDS,
+        )
+
+    def _record_protective_sell_fill(
+        self,
+        order_id: str,
+        token_id: str,
+        cumulative_filled: Decimal,
+    ) -> None:
+        """Remember newly confirmed SELL shares while position APIs catch up."""
+        cumulative_filled = max(Decimal(), cumulative_filled)
+        previous = self._confirmed_exit_fills.get(order_id, Decimal())
+        if cumulative_filled <= previous:
+            return
+        delta = cumulative_filled - previous
+        self._confirmed_exit_fills[order_id] = cumulative_filled
+        self._record_recent_exit_coverage(
+            token_id,
+            delta,
+            source="Protective SELL fill",
+        )
+
+    def _recent_exit_suppression_size(self, token_id: str) -> Decimal:
+        recent = self._recent_exit_fills.get(token_id)
+        if recent is None:
+            return Decimal()
+        size, expires_at = recent
+        if monotonic() >= expires_at:
+            self._recent_exit_fills.pop(token_id, None)
+            return Decimal()
+        return size
+
+    async def _refresh_positions_if_due(self, *, force: bool = False) -> bool:
+        now = monotonic()
+        if not force and now < self._next_position_poll_at:
             return True
         condition_ids = [market.condition_id for market in self.config.enabled_markets]
         try:
@@ -449,7 +586,7 @@ class MarketMakerEngine:
                             size,
                             market.label or market.token_id,
                         )
-                        await self._cancel_token_orders(market.token_id)
+                        await self._cancel_token_buy_orders(market.token_id)
                     continue
                 if size < baseline:
                     baseline = size
@@ -478,11 +615,24 @@ class MarketMakerEngine:
                         await self._handle_fill(tracked_buy, source="Position reconciliation")
                         continue
                 if self.config.sell_on_fill:
-                    unprotected = (
+                    raw_unprotected = (
                         size
                         - baseline
                         - self._protected_exit_size(market.token_id)
                     )
+                    suppressible = max(Decimal(), raw_unprotected)
+                    suppressed = min(
+                        suppressible,
+                        self._recent_exit_suppression_size(market.token_id),
+                    )
+                    unprotected = max(Decimal(), suppressible - suppressed)
+                    if suppressed > 0:
+                        logger.info(
+                            "Suppressing %s stale position share(s) for %s after "
+                            "a confirmed protective SELL",
+                            suppressed,
+                            market.token_id,
+                        )
                     if unprotected > 0:
                         intent = self._queue_position_exit(
                             market.token_id,
@@ -506,7 +656,7 @@ class MarketMakerEngine:
                         size,
                         market.label or market.token_id,
                     )
-                    await self._cancel_token_orders(market.token_id)
+                    await self._cancel_token_buy_orders(market.token_id)
         return True
 
     def _protected_exit_size(self, token_id: str) -> Decimal:
@@ -605,6 +755,12 @@ class MarketMakerEngine:
             if filled > order.filled_size:
                 order.filled_size = filled
                 changed = True
+            if order.quote.side == Side.SELL and order.filled_size > 0:
+                self._record_protective_sell_fill(
+                    order.order_id,
+                    order.quote.token_id,
+                    order.filled_size,
+                )
             if (
                 order.quote.side == Side.BUY
                 and order.filled_size > order.exit_requested_size
@@ -612,7 +768,7 @@ class MarketMakerEngine:
                 await self._handle_fill(order, source="REST")
             status = _normalise_status(state.get("status"))
             if status in TERMINAL_ORDER_STATUSES:
-                self.orders.pop(order.order_id, None)
+                self._pop_order(order.order_id)
                 changed = True
             elif status not in OPEN_ORDER_STATUSES:
                 logger.warning(
@@ -642,13 +798,19 @@ class MarketMakerEngine:
         confirmed_filled = min(filled, order.quote.size)
         if confirmed_filled > order.filled_size:
             order.filled_size = confirmed_filled
+        if order.quote.side == Side.SELL and confirmed_filled > 0:
+            self._record_protective_sell_fill(
+                order.order_id,
+                order.quote.token_id,
+                confirmed_filled,
+            )
         if (
             order.quote.side == Side.BUY
             and confirmed_filled > order.exit_requested_size
         ):
             self._missing_order_counts.pop(order.order_id, None)
             await self._handle_fill(order, source="REST trade reconciliation")
-            self.orders.pop(order.order_id, None)
+            self._pop_order(order.order_id)
             logger.warning(
                 "Absent order %s matched %s shares according to trade history",
                 order.order_id,
@@ -668,7 +830,7 @@ class MarketMakerEngine:
             )
             return False
         self._missing_order_counts.pop(order.order_id, None)
-        self.orders.pop(order.order_id, None)
+        self._pop_order(order.order_id)
         logger.info(
             "Order %s remained absent with no matching trade; removing stale journal entry",
             order.order_id,
@@ -913,7 +1075,7 @@ class MarketMakerEngine:
         failures: list[str] = []
         for order in list(self.orders.values()):
             if await self._cancel_order_reliably(order):
-                self.orders.pop(order.order_id, None)
+                self._pop_order(order.order_id)
                 self._persist_orders()
             else:
                 failures.append(order.order_id)
@@ -924,7 +1086,7 @@ class MarketMakerEngine:
             if order.quote.token_id != token_id:
                 continue
             if await self._cancel_order_reliably(order):
-                self.orders.pop(order.order_id, None)
+                self._pop_order(order.order_id)
                 self._persist_orders()
 
     async def _handle_fill(
@@ -962,10 +1124,8 @@ class MarketMakerEngine:
             await self._cancel_token_buy_orders(order.quote.token_id)
 
     async def _cancel_token_buy_orders(self, token_id: str) -> None:
-        if token_id in self._canceling_buy_tokens:
-            return
-        self._canceling_buy_tokens.add(token_id)
-        try:
+        lock = self._cancel_buy_token_locks.setdefault(token_id, asyncio.Lock())
+        async with lock:
             for order in list(self.orders.values()):
                 if order.quote.token_id != token_id or order.quote.side != Side.BUY:
                     continue
@@ -1010,10 +1170,8 @@ class MarketMakerEngine:
                         )
                         if late_intent is not None:
                             self._schedule_exit(late_intent)
-                    self.orders.pop(order.order_id, None)
+                    self._pop_order(order.order_id)
                     self._persist_orders()
-        finally:
-            self._canceling_buy_tokens.discard(token_id)
 
     def _queue_fill_exit(self, order: ManagedOrder, source: str) -> ExitIntent | None:
         if not self.config.sell_on_fill or order.filled_size <= 0:
@@ -1201,7 +1359,7 @@ class MarketMakerEngine:
                 with suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(self.stop.wait(), timeout=delay)
                 continue
-            self.orders[exit_order.order_id] = exit_order
+            self._register_order(exit_order)
             self.pending_exits.pop(intent.intent_id, None)
             self._persist_orders()
             self.last_exit_submitted_at = time()
@@ -1303,6 +1461,11 @@ class MarketMakerEngine:
             return False
         position = positions.get(intent.token_id, Decimal())
         if position <= 0:
+            self._record_recent_exit_coverage(
+                intent.token_id,
+                intent.size,
+                source="Zero position fallback",
+            )
             self.client.discard_prepared_order(intent.intent_id)
             self.pending_exits.pop(intent.intent_id, None)
             self._persist_orders()
@@ -1490,6 +1653,30 @@ class MarketMakerEngine:
         await self._cancel_token_buy_orders(token_id)
         self._quote_wakeup.set()
 
+    def _trade_candidate_is_user(
+        self,
+        event: dict,
+        item: dict,
+        *,
+        is_taker: bool,
+    ) -> bool:
+        trader_side = str(event.get("trader_side") or "").upper()
+        if is_taker and trader_side == "TAKER":
+            return True
+        if not is_taker and trader_side == "MAKER":
+            event_owner = str(event.get("owner") or event.get("trade_owner") or "")
+            item_owner = str(item.get("owner") or "")
+            if event_owner and item_owner == event_owner:
+                return True
+        api_key = str(getattr(self.client.settings, "api_key", None) or "")
+        if api_key and str(item.get("owner") or "") == api_key:
+            return True
+        if not is_taker and trader_side == "MAKER":
+            event_maker = str(event.get("maker_address") or "").casefold()
+            item_maker = str(item.get("maker_address") or "").casefold()
+            return bool(event_maker and item_maker == event_maker)
+        return False
+
     async def _handle_user_event(
         self,
         event: dict,
@@ -1505,45 +1692,138 @@ class MarketMakerEngine:
                 max(0.0, (received_at - matched_at) * 1000),
             )
         if event_kind == "order":
-            order = self.orders.get(str(event.get("id") or ""))
+            order = self._lookup_order(str(event.get("id") or ""))
             if order is None:
                 return
             filled = Decimal(str(event.get("size_matched") or "0"))
+            changed = filled > order.filled_size
             if filled > order.filled_size:
-                order.filled_size = filled
+                order.filled_size = min(order.quote.size, filled)
                 self._persist_orders()
+            if order.quote.side == Side.SELL and order.filled_size > 0:
+                self._record_protective_sell_fill(
+                    order.order_id,
+                    order.quote.token_id,
+                    order.filled_size,
+                )
+            if changed and order.quote.side == Side.BUY:
                 await self._handle_fill(
                     order,
                     source="WebSocket",
                     matched_at=matched_at,
                 )
             if str(event.get("type") or "").upper() == "CANCELLATION":
-                self.orders.pop(order.order_id, None)
+                self._pop_order(order.order_id)
                 self._persist_orders()
         elif event_kind == "trade":
-            candidates = list(event.get("maker_orders") or [])
+            if str(event.get("status") or "").upper().endswith("FAILED"):
+                return
+            candidates = [
+                (item, False)
+                for item in (event.get("maker_orders") or [])
+                if isinstance(item, dict)
+            ]
             taker_id = str(event.get("taker_order_id") or "")
             if taker_id:
                 candidates.append(
-                    {
-                        "order_id": taker_id,
-                        "matched_amount": event.get("size") or "0",
-                        "asset_id": event.get("asset_id"),
-                    }
+                    (
+                        {
+                            "order_id": taker_id,
+                            "matched_amount": event.get("size") or "0",
+                            "asset_id": event.get("asset_id"),
+                            "side": event.get("side"),
+                            "owner": event.get("owner") or event.get("trade_owner"),
+                            "maker_address": event.get("maker_address"),
+                        },
+                        True,
+                    )
                 )
-            for item in candidates:
-                order = self.orders.get(str(item.get("order_id") or ""))
-                if order is None:
+            configured_tokens = {
+                market.token_id for market in self.config.enabled_markets
+            }
+            force_position_refresh = False
+            trade_id = str(
+                event.get("id")
+                or event.get("transaction_hash")
+                or (
+                    f"{event.get('matchtime')}:{event.get('last_update')}:"
+                    f"{event.get('price')}:{event.get('size')}"
+                )
+            )
+            for item, is_taker in candidates:
+                order_id = str(item.get("order_id") or "")
+                match_key = (trade_id, order_id)
+                if match_key in self._seen_user_trade_matches:
                     continue
-                filled = Decimal(str(item.get("matched_amount") or "0"))
-                if filled > order.filled_size:
-                    order.filled_size = filled
+                self._seen_user_trade_matches.add(match_key)
+                matched = Decimal(str(item.get("matched_amount") or "0"))
+                if matched <= 0:
+                    continue
+                order = self._lookup_order(order_id)
+                if order is not None:
+                    previous = order.filled_size
+                    trade_cumulative = (
+                        self._trade_matched_fills.get(order_id, Decimal())
+                        + matched
+                    )
+                    self._trade_matched_fills[order_id] = trade_cumulative
+                    order.filled_size = max(
+                        order.filled_size,
+                        min(order.quote.size, trade_cumulative),
+                    )
                     self._persist_orders()
-                await self._handle_fill(
-                    order,
-                    source="WebSocket",
-                    matched_at=matched_at,
+                    if order.quote.side == Side.SELL:
+                        self._record_protective_sell_fill(
+                            order.order_id,
+                            order.quote.token_id,
+                            order.filled_size,
+                        )
+                    elif order.filled_size > previous:
+                        await self._handle_fill(
+                            order,
+                            source="WebSocket",
+                            matched_at=matched_at,
+                        )
+                    continue
+
+                token_id = str(item.get("asset_id") or event.get("asset_id") or "")
+                if (
+                    token_id not in configured_tokens
+                    or not self._trade_candidate_is_user(
+                        event, item, is_taker=is_taker
+                    )
+                ):
+                    continue
+                force_position_refresh = True
+                side = str(item.get("side") or "").upper()
+                if side == Side.SELL:
+                    cumulative = self._confirmed_exit_fills.get(
+                        order_id, Decimal()
+                    ) + matched
+                    self._record_protective_sell_fill(
+                        order_id,
+                        token_id,
+                        cumulative,
+                    )
+                    continue
+                if side != Side.BUY or not self.config.sell_on_fill:
+                    continue
+                self._orphan_buy_exit_sizes[order_id] = (
+                    self._orphan_buy_exit_sizes.get(order_id, Decimal()) + matched
                 )
+                intent = self._queue_position_exit(
+                    token_id,
+                    matched,
+                    bool(self.latest_books.get(token_id, {}).get("neg_risk", False)),
+                    "Unattributed WebSocket BUY trade",
+                )
+                if intent is not None:
+                    self._schedule_exit(intent)
+                    self.halted_tokens.add(token_id)
+                    await self._cancel_token_buy_orders(token_id)
+            if force_position_refresh:
+                self._next_position_poll_at = 0.0
+                await self._refresh_positions_if_due(force=True)
 
     async def pause_quotes(self) -> dict:
         """Pause new quotes and cancel every order on configured tokens."""
