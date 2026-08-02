@@ -6,3 +6,5 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 .poly-mm-orders.json
+.DS_Store
+design-qa-*.png

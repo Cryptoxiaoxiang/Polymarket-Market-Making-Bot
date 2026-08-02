@@ -2,6 +2,7 @@
 set -euo pipefail
 
 INSTALL_DIR="${POLYMM_INSTALL_DIR:-/opt/polymarket-mm-bot}"
+STATE_DIR="${POLYMM_STATE_DIR:-/var/lib/polymarket-mm-bot}"
 SERVICE_NAME="polymarket-mm-bot"
 SERVICE_USER="polymm"
 PYTHON_BIN="${POLYMM_PYTHON:-python3}"
@@ -44,6 +45,11 @@ if [[ ! -e "${INSTALL_DIR}/config.toml" ]]; then
   install -o root -g "${SERVICE_USER}" -m 0640 \
     "${SOURCE_DIR}/config.example.toml" "${INSTALL_DIR}/config.toml"
 fi
+install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0700 "${STATE_DIR}"
+if [[ ! -e "${STATE_DIR}/config.toml" ]]; then
+  install -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0600 \
+    "${INSTALL_DIR}/config.toml" "${STATE_DIR}/config.toml"
+fi
 if [[ ! -e "${INSTALL_DIR}/.env" ]]; then
   install -o root -g "${SERVICE_USER}" -m 0640 \
     "${SOURCE_DIR}/.env.example" "${INSTALL_DIR}/.env"
@@ -65,6 +71,8 @@ chown root:root \
   "${INSTALL_DIR}/.env.example"
 chown root:"${SERVICE_USER}" "${INSTALL_DIR}/config.toml"
 chmod 0640 "${INSTALL_DIR}/config.toml"
+chown "${SERVICE_USER}":"${SERVICE_USER}" "${STATE_DIR}/config.toml"
+chmod 0600 "${STATE_DIR}/config.toml"
 chown "${SERVICE_USER}":"${SERVICE_USER}" "${INSTALL_DIR}/.env"
 chmod 0600 "${INSTALL_DIR}/.env"
 

@@ -137,7 +137,7 @@ def test_web_setup_is_explicitly_saved_and_can_be_cleared(tmp_path, monkeypatch)
     config_path = tmp_path / "config.toml"
     config_path.write_text(
         "dry_run = false\n[risk]\nmax_position_per_token = \"25\"\n"
-        "max_total_open_notional = \"100\"\n",
+        "max_total_open_shares = \"100\"\n",
         encoding="utf-8",
     )
     env_path = tmp_path / ".env"
@@ -164,7 +164,7 @@ def test_web_setup_is_explicitly_saved_and_can_be_cleared(tmp_path, monkeypatch)
             }
         ],
         "max_position_per_token": "12",
-        "max_total_open_notional": "40",
+        "max_total_open_shares": "40",
         "cancel_after_seconds": "8",
         "run_duration_enabled": True,
         "run_duration_hours": 1,
@@ -178,6 +178,7 @@ def test_web_setup_is_explicitly_saved_and_can_be_cleared(tmp_path, monkeypatch)
     assert config.markets[0].token_id == "123"
     assert config.markets[0].quote_size == Decimal("2.5")
     assert config.risk.max_order_size == Decimal("2.5")
+    assert config.risk.max_total_open_shares == Decimal("40")
     assert config.run_duration_seconds == 5_400
     assert config.dry_run is False
 

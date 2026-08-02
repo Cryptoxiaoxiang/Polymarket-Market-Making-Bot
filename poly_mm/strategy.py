@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 from poly_mm.config import MarketConfig, StrategyConfig
 from poly_mm.models import OrderBook, Quote, Side, round_down_to_tick
+
+STANDARD_SPREAD_TICK = Decimal("0.01")
 
 
 class PassiveMakerStrategy:
@@ -13,7 +17,10 @@ class PassiveMakerStrategy:
     def build_quote(self, market: MarketConfig, book: OrderBook) -> Quote | None:
         if not book.best_bid or not book.best_ask or book.spread is None:
             return None
-        if not self.config.min_spread <= book.spread <= self.config.max_spread:
+        spread_scale = min(Decimal(1), book.tick_size / STANDARD_SPREAD_TICK)
+        minimum_spread = self.config.min_spread * spread_scale
+        maximum_spread = self.config.max_spread * spread_scale
+        if not minimum_spread <= book.spread <= maximum_spread:
             return None
         raw_price = book.best_bid.price if self.config.join_best_price else (
             book.best_bid.price - book.tick_size * self.config.min_edge_ticks

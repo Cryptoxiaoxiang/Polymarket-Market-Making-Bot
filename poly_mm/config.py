@@ -22,6 +22,7 @@ class Settings:
     data_api_url: str = "https://data-api.polymarket.com"
     geoblock_url: str = "https://polymarket.com/api/geoblock"
     user_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+    market_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
     @classmethod
     def from_env(cls, path: str | Path = ".env") -> "Settings":
@@ -35,6 +36,10 @@ class Settings:
             api_passphrase=os.getenv("POLYMARKET_API_PASSPHRASE") or None,
             order_journal_path=os.getenv(
                 "POLYMARKET_ORDER_JOURNAL_PATH", ".poly-mm-orders.json"
+            ),
+            market_ws_url=os.getenv(
+                "POLYMARKET_MARKET_WS_URL",
+                "wss://ws-subscriptions-clob.polymarket.com/ws/market",
             ),
         )
 
@@ -55,7 +60,7 @@ class MarketConfig:
 class StrategyConfig:
     quote_size: Decimal = Decimal("5")
     join_best_price: bool = False
-    min_edge_ticks: int = 1
+    min_edge_ticks: int = 2
     min_spread: Decimal = Decimal("0.02")
     max_spread: Decimal = Decimal("0.15")
 
@@ -63,8 +68,8 @@ class StrategyConfig:
 @dataclass(frozen=True)
 class RiskConfig:
     max_order_size: Decimal = Decimal("10")
-    max_position_per_token: Decimal = Decimal("25")
-    max_total_open_notional: Decimal = Decimal("100")
+    max_position_per_token: Decimal = Decimal("100")
+    max_total_open_shares: Decimal = Decimal("100")
     max_open_orders_per_token: int = 1
 
 
@@ -72,11 +77,12 @@ class RiskConfig:
 class BotConfig:
     dry_run: bool = False
     poll_interval_seconds: float = 2
-    cancel_after_seconds: float = 10
+    cancel_after_seconds: float = 8
     run_duration_seconds: int = 0
     cancel_all_on_start: bool = True
     cancel_all_on_shutdown: bool = True
     halt_on_fill: bool = True
+    sell_on_fill: bool = True
     preflight_enabled: bool = True
     websocket_enabled: bool = True
     position_poll_interval_seconds: float = 5
@@ -101,10 +107,18 @@ def load_config(path: str | Path, *, require_markets: bool = True) -> BotConfig:
     strategy = StrategyConfig(
         **_decimal_fields(strategy_raw, {"quote_size", "min_spread", "max_spread"})
     )
+    # Read the old notional key as a shares limit so existing installations can
+    # upgrade without failing to start. Newly written configs only use the new name.
+    if (
+        "max_total_open_shares" not in risk_raw
+        and "max_total_open_notional" in risk_raw
+    ):
+        risk_raw = dict(risk_raw)
+        risk_raw["max_total_open_shares"] = risk_raw.pop("max_total_open_notional")
     risk = RiskConfig(
         **_decimal_fields(
             risk_raw,
-            {"max_order_size", "max_position_per_token", "max_total_open_notional"},
+            {"max_order_size", "max_position_per_token", "max_total_open_shares"},
         )
     )
     markets = [
@@ -113,11 +127,12 @@ def load_config(path: str | Path, *, require_markets: bool = True) -> BotConfig:
     config = BotConfig(
         dry_run=bool(data.get("dry_run", False)),
         poll_interval_seconds=float(data.get("poll_interval_seconds", 2)),
-        cancel_after_seconds=float(data.get("cancel_after_seconds", 10)),
+        cancel_after_seconds=float(data.get("cancel_after_seconds", 8)),
         run_duration_seconds=max(0, int(data.get("run_duration_seconds", 0))),
         cancel_all_on_start=bool(data.get("cancel_all_on_start", True)),
         cancel_all_on_shutdown=bool(data.get("cancel_all_on_shutdown", True)),
         halt_on_fill=bool(data.get("halt_on_fill", True)),
+        sell_on_fill=bool(data.get("sell_on_fill", True)),
         preflight_enabled=bool(data.get("preflight_enabled", True)),
         websocket_enabled=bool(data.get("websocket_enabled", True)),
         position_poll_interval_seconds=float(
@@ -165,7 +180,7 @@ def load_config(path: str | Path, *, require_markets: bool = True) -> BotConfig:
     if (
         config.risk.max_order_size <= 0
         or config.risk.max_position_per_token <= 0
-        or config.risk.max_total_open_notional <= 0
+        or config.risk.max_total_open_shares <= 0
     ):
         raise ValueError("risk limits must be positive")
     if config.risk.max_open_orders_per_token < 1:
@@ -195,6 +210,7 @@ def _config_text(config: BotConfig) -> str:
         f"cancel_all_on_start = {_toml_bool(config.cancel_all_on_start)}",
         f"cancel_all_on_shutdown = {_toml_bool(config.cancel_all_on_shutdown)}",
         f"halt_on_fill = {_toml_bool(config.halt_on_fill)}",
+        f"sell_on_fill = {_toml_bool(config.sell_on_fill)}",
         f"preflight_enabled = {_toml_bool(config.preflight_enabled)}",
         f"websocket_enabled = {_toml_bool(config.websocket_enabled)}",
         f"position_poll_interval_seconds = {config.position_poll_interval_seconds}",
@@ -232,7 +248,7 @@ def _config_text(config: BotConfig) -> str:
             "[risk]",
             f'max_order_size = "{config.risk.max_order_size}"',
             f'max_position_per_token = "{config.risk.max_position_per_token}"',
-            f'max_total_open_notional = "{config.risk.max_total_open_notional}"',
+            f'max_total_open_shares = "{config.risk.max_total_open_shares}"',
             f"max_open_orders_per_token = {config.risk.max_open_orders_per_token}",
             "",
         ]
